@@ -5,6 +5,6 @@ export { WhiteboardPanel } from "./WhiteboardPanel";
 export { VoiceRecognition } from "./VoiceRecognition";
 export { TextToSpeech, useTextToSpeech } from "./TextToSpeech";
 export { ProctoringMonitor, useProctoring, type ProctoringEvent } from "./ProctoringMonitor";
-export { RealtimeVoiceAgent, type VoiceMessage } from "./RealtimeVoiceAgent";
+export { BhashiniVoiceAgent, BhashiniVoiceAgent as RealtimeVoiceAgent, type VoiceMessage } from "./BhashiniVoiceAgent";
 export { ContinuousVoicePanel } from "./ContinuousVoicePanel";
 export { AudioCheck } from "./AudioCheck";
