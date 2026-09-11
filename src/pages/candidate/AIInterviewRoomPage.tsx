@@ -84,7 +84,7 @@ export default function AIInterviewRoomPage() {
   const [interviewType] = useState<InterviewType>(
     (searchParams.get("type") as InterviewType) || "technical"
   );
-  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to ElevenLabs realtime
+  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to Bhashini realtime voice
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
