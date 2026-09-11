@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   VideoPanel,
   ContinuousVoicePanel,
-  RealtimeVoiceAgent,
+  BhashiniVoiceAgent,
   CodeEditorPanel,
   WhiteboardPanel,
   ProctoringMonitor,
@@ -84,7 +84,7 @@ export default function AIInterviewRoomPage() {
   const [interviewType] = useState<InterviewType>(
     (searchParams.get("type") as InterviewType) || "technical"
   );
-  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to ElevenLabs realtime
+  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to Bhashini realtime voice
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -953,7 +953,7 @@ export default function AIInterviewRoomPage() {
           {/* Voice Agent - Full width on mobile */}
           <div className="flex-1 min-h-0">
             {voiceMode === "realtime" ? (
-              <RealtimeVoiceAgent
+              <BhashiniVoiceAgent
                 jobField={jobContext?.jobField}
                 toughnessLevel={
                   jobContext?.toughnessLevel 
@@ -1205,7 +1205,7 @@ export default function AIInterviewRoomPage() {
           workspaceMode === "conversation" ? "col-span-9" : "col-span-4"
         )}>
           {voiceMode === "realtime" ? (
-            <RealtimeVoiceAgent
+            <BhashiniVoiceAgent
               jobField={jobContext?.jobField}
               toughnessLevel={
                 jobContext?.toughnessLevel 
