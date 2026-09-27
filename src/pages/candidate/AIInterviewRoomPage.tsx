@@ -47,6 +47,9 @@ import {
   ChevronUp,
   ChevronDown,
   X,
+  Monitor,
+  MonitorOff,
+  RefreshCw,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { GlassCard } from "@/components/ui/glass-card";
@@ -59,6 +62,8 @@ import { useInterviewRecording } from "@/hooks/useInterviewRecording";
 import { useProctoringLogger } from "@/hooks/useProctoringLogger";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { submitRoundResult } from "@/lib/round-submission";
+import { resolveCandidateIdentity } from "@/lib/candidate-utils";
+import { checkFrameLuminance, verifyEntireScreenShare } from "@/lib/preflight-checker";
 
 type InterviewStatus = "preparing" | "in-progress" | "completing" | "completed";
 type InterviewType = "technical" | "system-design" | "behavioral";
@@ -95,7 +100,7 @@ export default function AIInterviewRoomPage() {
     interviewType === "system-design" ? "whiteboard" : interviewType === "technical" ? "code" : "conversation"
   );
 
-  // Live captions state
+  // Live captions and persistent question/speech state
   const [activeCaption, setActiveCaption] = useState<{
     speaker: "ai" | "candidate";
     text: string;
@@ -103,6 +108,22 @@ export default function AIInterviewRoomPage() {
   const [transcriptLog, setTranscriptLog] = useState<
     Array<{ speaker: "ai" | "candidate"; text: string; timestamp: number }>
   >([]);
+  const [currentAiQuestion, setCurrentAiQuestion] = useState<string>(
+    "Welcome! The AI interviewer is ready to begin your interview."
+  );
+  const [currentCandidateSpeech, setCurrentCandidateSpeech] = useState<string>("");
+
+  // Preflight verification states
+  const preflightVideoRef = useRef<HTMLVideoElement>(null);
+  const [preflightStream, setPreflightStream] = useState<MediaStream | null>(null);
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [preflightCameraStatus, setPreflightCameraStatus] = useState<"checking" | "ready" | "too_dark" | "disconnected">("checking");
+  const [preflightCameraBrightness, setPreflightCameraBrightness] = useState<number>(0);
+  const [preflightMicStatus, setPreflightMicStatus] = useState<"checking" | "ready" | "no_input" | "disconnected">("checking");
+  const [preflightMicLevel, setPreflightMicLevel] = useState<number>(0);
+  const [preflightScreenStatus, setPreflightScreenStatus] = useState<"not_shared" | "wrong_surface" | "entire_screen" | "stopped">("not_shared");
+  const [preflightScreenError, setPreflightScreenError] = useState<string | null>(null);
+  const [isScreenInterrupted, setIsScreenInterrupted] = useState<boolean>(false);
 
   // Mobile state for panel visibility - MUST be declared here with other hooks
   const [mobilePanel, setMobilePanel] = useState<"video" | "code" | null>(null);
@@ -200,27 +221,18 @@ export default function AIInterviewRoomPage() {
       const applicationId = searchParams.get("application");
       
       try {
-        // Fetch current user's profile for candidate name
         const { data: { user } } = await supabase.auth.getUser();
-        let candidateName: string | undefined;
+        let candidateName = "Candidate";
+        let candidateIdVal: string | null = user?.id || null;
         
         if (user) {
-          // Set candidate ID for recording
           setCandidateId(user.id);
-          
-          const { data: profile } = await supabase
-            .from("profiles")
-            .select("full_name")
-            .eq("user_id", user.id)
-            .maybeSingle();
-          
-          if (profile?.full_name) {
-            candidateName = profile.full_name;
-          }
         }
         
         if (!applicationId) {
-          // Even without application, set candidate name
+          if (user?.id) {
+            candidateName = await resolveCandidateIdentity(user.id);
+          }
           setJobContext({
             toughnessLevel: 3,
             jobField: "General",
@@ -234,6 +246,7 @@ export default function AIInterviewRoomPage() {
           .from("applications")
           .select(`
             id,
+            candidate_id,
             job_id,
             current_round,
             status,
@@ -245,6 +258,15 @@ export default function AIInterviewRoomPage() {
           `)
           .eq("id", applicationId)
           .maybeSingle();
+
+        if (application?.candidate_id) {
+          candidateIdVal = application.candidate_id;
+          setCandidateId(application.candidate_id);
+        }
+
+        if (candidateIdVal) {
+          candidateName = await resolveCandidateIdentity(candidateIdVal);
+        }
 
         if (application?.jobs) {
           const job = application.jobs as any;
@@ -292,7 +314,6 @@ export default function AIInterviewRoomPage() {
             setRemainingTime(configuredDuration);
           }
         } else {
-          // No application found, still set candidate name
           setJobContext({
             toughnessLevel: 3,
             jobField: "General",
@@ -359,6 +380,193 @@ export default function AIInterviewRoomPage() {
     }
   }, [antiCheat]);
 
+  // Preflight: Initialize camera & microphone stream for inspection
+  useEffect(() => {
+    if (status !== "preparing") return;
+
+    let activeStream: MediaStream | null = null;
+    let audioCtx: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let animFrame: number;
+
+    const initPreflightMedia = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+          audio: { echoCancellation: true, noiseSuppression: true },
+        });
+        activeStream = stream;
+        setPreflightStream(stream);
+
+        if (preflightVideoRef.current) {
+          preflightVideoRef.current.srcObject = stream;
+        }
+
+        // Setup microphone analyzer
+        try {
+          audioCtx = new AudioContext();
+          const source = audioCtx.createMediaStreamSource(stream);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+          const checkAudio = () => {
+            if (!analyser) return;
+            analyser.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+              sum += dataArray[i];
+            }
+            const avg = sum / dataArray.length;
+            const level = Math.min(100, Math.round((avg / 128) * 100));
+            setPreflightMicLevel(level);
+
+            if (level > 2) {
+              setPreflightMicStatus("ready");
+            }
+            animFrame = requestAnimationFrame(checkAudio);
+          };
+          checkAudio();
+        } catch (audioErr) {
+          console.warn("Audio meter setup warning:", audioErr);
+          setPreflightMicStatus("ready");
+        }
+      } catch (err) {
+        console.error("Preflight camera/mic access error:", err);
+        setPreflightCameraStatus("disconnected");
+        setPreflightMicStatus("disconnected");
+      }
+    };
+
+    initPreflightMedia();
+
+    return () => {
+      cancelAnimationFrame(animFrame);
+      if (audioCtx && audioCtx.state !== "closed") {
+        audioCtx.close().catch(() => {});
+      }
+    };
+  }, [status]);
+
+  // Periodic camera quality / darkness check during preflight
+  useEffect(() => {
+    if (status !== "preparing") return;
+
+    const interval = setInterval(() => {
+      if (preflightVideoRef.current && preflightVideoRef.current.videoWidth > 0) {
+        const lumResult = checkFrameLuminance(preflightVideoRef.current);
+        setPreflightCameraBrightness(Math.round(lumResult.luminance));
+        if (!lumResult.passed) {
+          setPreflightCameraStatus("too_dark");
+          proctoringLogger.logProctoringEvent("camera_too_dark", "medium", `Camera image too dark: ${lumResult.luminance.toFixed(1)}%`);
+        } else {
+          setPreflightCameraStatus("ready");
+        }
+      }
+    }, 800);
+
+    return () => clearInterval(interval);
+  }, [status, proctoringLogger]);
+
+  // Handle candidate entire-screen sharing request
+  const handleRequestScreenShare = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "monitor" } as any,
+        audio: false,
+      });
+
+      const check = verifyEntireScreenShare(stream);
+      if (!check.valid) {
+        stream.getTracks().forEach((t) => t.stop());
+        setPreflightScreenStatus("wrong_surface");
+        setPreflightScreenError(check.reason || "Please select your ENTIRE SCREEN.");
+        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.reason || "Non-monitor surface selected");
+        return;
+      }
+
+      setScreenStream(stream);
+      setPreflightScreenStatus("entire_screen");
+      setPreflightScreenError(null);
+      proctoringLogger.logProctoringEvent("screen_share_started", "low", "Candidate shared entire screen (monitor)");
+
+      const displayTrack = stream.getVideoTracks()[0];
+      if (displayTrack) {
+        displayTrack.onended = () => {
+          handleScreenShareInterrupted();
+        };
+      }
+    } catch (err: any) {
+      console.warn("Screen share request cancelled or error:", err);
+      setPreflightScreenStatus("not_shared");
+      setPreflightScreenError(err.message || "Screen share was not completed.");
+    }
+  };
+
+  // Screen share stopped mid-interview
+  const handleScreenShareInterrupted = useCallback(() => {
+    setIsScreenInterrupted(true);
+    setPreflightScreenStatus("stopped");
+    stopSpeaking();
+    proctoringLogger.logProctoringEvent("screen_share_stopped", "critical", "Screen share stopped during active interview");
+  }, [stopSpeaking, proctoringLogger]);
+
+  // Resume screen sharing mid-interview
+  const handleResumeScreenShare = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "monitor" } as any,
+        audio: false,
+      });
+
+      const check = verifyEntireScreenShare(stream);
+      if (!check.valid) {
+        stream.getTracks().forEach((t) => t.stop());
+        toast({
+          title: "Entire Screen Required",
+          description: check.reason || "Please select your ENTIRE SCREEN.",
+          variant: "destructive",
+        });
+        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.reason || "Non-monitor surface selected on resume");
+        return;
+      }
+
+      setScreenStream(stream);
+      setPreflightScreenStatus("entire_screen");
+      setIsScreenInterrupted(false);
+      proctoringLogger.logProctoringEvent("screen_share_restored", "low", "Candidate restored entire screen sharing");
+
+      const displayTrack = stream.getVideoTracks()[0];
+      if (displayTrack) {
+        displayTrack.onended = () => {
+          handleScreenShareInterrupted();
+        };
+      }
+    } catch (err: any) {
+      console.error("Resume screen share failed:", err);
+      toast({
+        title: "Screen Share Required",
+        description: "You must share your entire screen to continue the interview.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  // Part 11: Periodic AI reminder to share entire screen during preflight
+  useEffect(() => {
+    if (status !== "preparing") return;
+    if (preflightScreenStatus === "entire_screen") return;
+
+    const interval = setInterval(() => {
+      if (!ttsIsSpeaking) {
+        speak("Please share your entire screen to continue the interview.");
+      }
+    }, 13000);
+
+    return () => clearInterval(interval);
+  }, [status, preflightScreenStatus, ttsIsSpeaking, speak]);
+
   // Start interview with greeting and server timestamp initialization
   const startInterview = useCallback(async () => {
     setStatus("in-progress");
@@ -390,8 +598,9 @@ export default function AIInterviewRoomPage() {
 
     // Start recording and proctoring
     try {
-      await interviewRecording.startRecording();
+      await interviewRecording.startRecording(preflightStream || undefined);
       proctoringLogger.startLogging();
+      proctoringLogger.logProctoringEvent("screen_share_started", "low", "Entire screen sharing verified for interview start");
     } catch (error) {
       console.error("Failed to start recording:", error);
     }
@@ -411,6 +620,7 @@ export default function AIInterviewRoomPage() {
           },
         ]);
         setQuestionCount(1);
+        setCurrentAiQuestion(greeting);
 
         // Speak the greeting
         if (isSpeaking) {
@@ -428,7 +638,7 @@ export default function AIInterviewRoomPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [toast, isSpeaking, speak, interviewRecording, proctoringLogger]);
+  }, [toast, isSpeaking, speak, interviewRecording, proctoringLogger, preflightStream, applicationId, interviewDuration]);
 
   // Send message to AI agent
   const sendToAgent = async (conversationMessages: Array<{ role: string; content: string }>) => {
@@ -451,12 +661,16 @@ export default function AIInterviewRoomPage() {
         },
         body: JSON.stringify({
           messages: conversationMessages,
+          applicationId: applicationId || undefined,
           jobField: jobContext?.jobField || (interviewType === "technical" ? "Data Structures and Algorithms" : 
                    interviewType === "system-design" ? "System Design" : "Behavioral"),
           toughnessLevel: toughnessMap[jobContext?.toughnessLevel || 3] || "medium",
           currentQuestionIndex: questionCount,
           candidateScore: currentScore,
           jobTitle: jobContext?.jobTitle,
+          candidateName: jobContext?.candidateName,
+          durationSeconds: interviewDuration,
+          remainingSeconds: remainingTime,
         }),
       }
     );
@@ -615,6 +829,13 @@ export default function AIInterviewRoomPage() {
     }
 
     try {
+      preflightStream?.getTracks().forEach((track) => track.stop());
+      screenStream?.getTracks().forEach((track) => track.stop());
+    } catch (streamErr) {
+      console.warn("Error stopping media tracks on interview end:", streamErr);
+    }
+
+    try {
       // 1. Persist transcript messages to interview_transcripts table
       if (applicationId && transcriptLog.length > 0) {
         try {
@@ -737,86 +958,209 @@ export default function AIInterviewRoomPage() {
     setIsListening((prev) => !prev);
   }, []);
 
-  // Render preparing screen
+  // Render preparing screen (Interview Preflight Station)
   if (status === "preparing") {
+    const canStartInterview =
+      preflightCameraStatus === "ready" &&
+      (preflightMicStatus === "ready" || preflightMicLevel > 2) &&
+      preflightScreenStatus === "entire_screen" &&
+      !isLoading;
+
     return (
       <div className="min-h-screen bg-background flex items-center justify-center p-4">
         <motion.div
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
-          className="max-w-lg w-full"
+          className="max-w-xl w-full"
         >
-          <GlassCard className="text-center">
-            <div className="mb-6">
-              <div className="h-20 w-20 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
-                <Brain className="h-10 w-10 text-primary" />
+          <GlassCard className="text-center p-6 space-y-6">
+            <div className="text-center">
+              <div className="h-16 w-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-3">
+                <Brain className="h-8 w-8 text-primary" />
               </div>
-              <h1 className="text-2xl font-bold mb-2">AI Interview Room</h1>
-              <p className="text-muted-foreground">
-                You're about to start a {interviewType.replace("-", " ")} interview with our AI interviewer.
+              <h1 className="text-2xl font-bold mb-1">Interview Preflight Check</h1>
+              <p className="text-base font-semibold text-primary">
+                {jobContext?.candidateName || "Candidate"}
+              </p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {jobContext?.jobTitle || "Open Role"} • Round {currentRoundNumber} • {Math.floor(interviewDuration / 60)} Minutes
               </p>
             </div>
 
-            <div className="space-y-4 mb-6 text-left">
-              <div className="flex items-center gap-3 p-3 rounded-lg bg-secondary/50">
-                <Clock className="h-5 w-5 text-primary" />
-                <div>
-                  <p className="font-medium">Duration: 45 minutes</p>
-                  <p className="text-sm text-muted-foreground">Timer will start when you begin</p>
-                </div>
+            {/* Periodic Entire Screen Reminder Notice */}
+            {preflightScreenStatus !== "entire_screen" && (
+              <div className="p-3 rounded-lg bg-primary/10 border border-primary/20 text-xs text-primary flex items-center gap-2 animate-pulse text-left">
+                <Monitor className="h-4 w-4 shrink-0 text-primary" />
+                <span>Please share your entire screen to continue the interview.</span>
               </div>
+            )}
 
-              <div className="flex items-center gap-3 p-3 rounded-lg bg-success/10 border border-success/30">
-                <Mic className="h-5 w-5 text-success" />
-                <div>
-                  <p className="font-medium flex items-center gap-2">
-                    Real-time Voice
-                    <Badge variant="outline" className="text-xs bg-success/10 text-success border-success/30">
-                      <Zap className="h-3 w-3 mr-1" />
-                      AI-Powered
+            {/* Preflight Verification Checklist */}
+            <div className="space-y-4 text-left">
+              {/* 1. Camera & Darkness Check */}
+              <div className="p-4 rounded-xl bg-secondary/30 border border-border/50 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Video className="h-4 w-4 text-primary" />
+                    <span className="font-medium text-sm">Camera Verification</span>
+                  </div>
+                  {preflightCameraStatus === "ready" ? (
+                    <Badge className="bg-success text-success-foreground text-xs gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      Ready ({preflightCameraBrightness}%)
                     </Badge>
-                  </p>
-                  <p className="text-sm text-muted-foreground">Natural conversation — just speak, no buttons needed</p>
+                  ) : preflightCameraStatus === "too_dark" ? (
+                    <Badge variant="destructive" className="text-xs gap-1">
+                      <AlertTriangle className="h-3 w-3" />
+                      Too Dark ({preflightCameraBrightness}%)
+                    </Badge>
+                  ) : preflightCameraStatus === "disconnected" ? (
+                    <Badge variant="destructive" className="text-xs gap-1">
+                      <AlertTriangle className="h-3 w-3" />
+                      Camera Error
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-xs gap-1">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Checking...
+                    </Badge>
+                  )}
                 </div>
+
+                <div className="relative rounded-lg overflow-hidden bg-black aspect-video max-h-40 mx-auto flex items-center justify-center">
+                  <video
+                    ref={preflightVideoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover"
+                  />
+                  {preflightCameraStatus === "too_dark" && (
+                    <div className="absolute inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center p-3 text-center">
+                      <p className="text-xs font-semibold text-warning">
+                        Camera image is too dark. Please turn on a light to continue.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {preflightCameraStatus === "too_dark" && (
+                  <p className="text-xs text-destructive font-medium">
+                    ⚠️ Your camera image is too dark. Please turn on a light or adjust your camera before continuing.
+                  </p>
+                )}
+                {preflightCameraStatus === "disconnected" && (
+                  <p className="text-xs text-destructive font-medium">
+                    ⚠️ Camera permission denied or disconnected. Please enable your camera.
+                  </p>
+                )}
               </div>
 
-              {interviewType === "technical" && (
-                <div className="flex items-center gap-3 p-3 rounded-lg bg-secondary/50">
-                  <Code2 className="h-5 w-5 text-primary" />
-                  <div>
-                    <p className="font-medium">Code Editor</p>
-                    <p className="text-sm text-muted-foreground">Write and run code for DSA problems</p>
+              {/* 2. Microphone Check */}
+              <div className="p-4 rounded-xl bg-secondary/30 border border-border/50 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Mic className="h-4 w-4 text-primary" />
+                    <span className="font-medium text-sm">Microphone Input</span>
                   </div>
+                  {preflightMicStatus === "ready" || preflightMicLevel > 2 ? (
+                    <Badge className="bg-success text-success-foreground text-xs gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      Ready
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-xs gap-1">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Speak to verify
+                    </Badge>
+                  )}
                 </div>
-              )}
+                <Progress value={preflightMicLevel} className="h-2" />
+                <p className="text-xs text-muted-foreground">
+                  Say something into your microphone to verify speech input level.
+                </p>
+              </div>
 
-              {interviewType === "system-design" && (
-                <div className="flex items-center gap-3 p-3 rounded-lg bg-secondary/50">
-                  <Layout className="h-5 w-5 text-primary" />
-                  <div>
-                    <p className="font-medium">Whiteboard</p>
-                    <p className="text-sm text-muted-foreground">Draw diagrams for system design</p>
+              {/* 3. Mandatory Entire-Screen Sharing (Monitor) */}
+              <div className="p-4 rounded-xl bg-secondary/30 border border-border/50 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Monitor className="h-4 w-4 text-primary" />
+                    <span className="font-medium text-sm">Entire Screen Sharing (Mandatory)</span>
                   </div>
+                  {preflightScreenStatus === "entire_screen" ? (
+                    <Badge className="bg-success text-success-foreground text-xs gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      Entire Screen Shared
+                    </Badge>
+                  ) : preflightScreenStatus === "wrong_surface" ? (
+                    <Badge variant="destructive" className="text-xs gap-1">
+                      <AlertTriangle className="h-3 w-3" />
+                      Wrong Surface
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-xs gap-1">
+                      Required
+                    </Badge>
+                  )}
                 </div>
-              )}
-            </div>
 
-            <div className="p-4 rounded-lg bg-warning/10 border border-warning/30 mb-6">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="h-5 w-5 text-warning mt-0.5" />
-                <div className="text-left">
-                  <p className="text-sm font-medium text-warning">Important</p>
-                  <p className="text-sm text-muted-foreground">
-                    Ensure your camera and microphone are working. The interview will be recorded and proctored.
-                  </p>
-                </div>
+                <p className="text-xs text-muted-foreground">
+                  To continue this proctored interview, please share your <strong>ENTIRE SCREEN</strong>. Sharing only a browser tab or individual window is not accepted.
+                </p>
+
+                {preflightScreenStatus === "entire_screen" ? (
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-success/10 border border-success/30 text-success text-xs font-medium">
+                    <span className="flex items-center gap-1.5">
+                      <CheckCircle2 className="h-4 w-4" />
+                      ✓ Entire Screen Verified (Monitor)
+                    </span>
+                    <Badge variant="outline" className="text-success border-success/30 bg-success/10">
+                      Active
+                    </Badge>
+                  </div>
+                ) : preflightScreenStatus === "wrong_surface" ? (
+                  <div className="p-3 rounded-lg bg-destructive/15 border border-destructive/30 space-y-2">
+                    <p className="text-xs font-semibold text-destructive flex items-center gap-1.5">
+                      <AlertTriangle className="h-4 w-4 shrink-0" />
+                      {preflightScreenError}
+                    </p>
+                    <Button
+                      type="button"
+                      onClick={handleRequestScreenShare}
+                      variant="destructive"
+                      size="sm"
+                      className="w-full gap-1.5"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Try Again (Select Entire Screen)
+                    </Button>
+                  </div>
+                ) : (
+                  <Button
+                    type="button"
+                    onClick={handleRequestScreenShare}
+                    variant="outline"
+                    className="w-full gap-2 border-primary/40 text-primary hover:bg-primary/10"
+                  >
+                    <Monitor className="h-4 w-4" />
+                    Share Entire Screen
+                  </Button>
+                )}
               </div>
             </div>
 
-            <Button onClick={startInterview} variant="hero" className="w-full" size="lg">
-              <Sparkles className="h-5 w-5 mr-2" />
-              Start Interview
-            </Button>
+            {/* Start Button */}
+            {canStartInterview ? (
+              <Button onClick={startInterview} variant="hero" className="w-full" size="lg">
+                <Sparkles className="h-5 w-5 mr-2" />
+                Start Interview
+              </Button>
+            ) : (
+              <Button disabled variant="outline" className="w-full opacity-60 cursor-not-allowed" size="lg">
+                Complete All 3 Preflight Checks to Start
+              </Button>
+            )}
           </GlassCard>
         </motion.div>
       </div>
@@ -1072,6 +1416,7 @@ export default function AIInterviewRoomPage() {
                   elapsedTime={elapsedTime}
                   remainingTime={remainingTime}
                   aiSpeaking={aiSpeaking}
+                  mediaStream={preflightStream}
                   className="h-full"
                 />
                 <Button
@@ -1104,6 +1449,11 @@ export default function AIInterviewRoomPage() {
                 onSpeakingChange={setAiSpeaking}
                 onLiveCaption={(cap) => {
                   setActiveCaption(cap);
+                  if (cap.speaker === "ai") {
+                    setCurrentAiQuestion(cap.text);
+                  } else if (cap.speaker === "candidate") {
+                    setCurrentCandidateSpeech(cap.text);
+                  }
                   if (cap.isFinal && cap.text.trim()) {
                     setTranscriptLog((prev) => [
                       ...prev,
@@ -1344,6 +1694,7 @@ export default function AIInterviewRoomPage() {
             elapsedTime={elapsedTime}
             remainingTime={remainingTime}
             aiSpeaking={aiSpeaking}
+            mediaStream={preflightStream}
             className="flex-1"
           />
           
@@ -1351,7 +1702,7 @@ export default function AIInterviewRoomPage() {
           {status === "in-progress" && interviewRecording.isRecording && (
             <Badge variant="outline" className="gap-1 text-danger border-danger/30 justify-center py-1">
               <Video className="h-3 w-3 animate-pulse" />
-              Recording
+              Recording Active
             </Badge>
           )}
           
@@ -1381,6 +1732,82 @@ export default function AIInterviewRoomPage() {
           "flex flex-col gap-3",
           workspaceMode === "conversation" ? "col-span-9" : "col-span-4"
         )}>
+          {/* Candidate & Job Info Strip */}
+          <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-secondary/30 border border-border/40 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-foreground">{jobContext?.candidateName || "Candidate"}</span>
+              <span className="text-muted-foreground">•</span>
+              <span className="text-muted-foreground">{jobContext?.jobTitle || "Role"}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Badge variant="outline" className="text-xs">
+                Round {currentRoundNumber}
+              </Badge>
+            </div>
+          </div>
+
+          {/* AI INTERVIEWER LIVE QUESTION DISPLAY */}
+          <div className="p-4 rounded-xl border border-primary/30 bg-card/90 backdrop-blur-md shadow-md">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <Badge className="bg-primary/20 text-primary border-primary/30 uppercase tracking-wider text-xs font-semibold">
+                  AI Interviewer
+                </Badge>
+                {aiSpeaking && (
+                  <span className="flex h-2 w-2 relative">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
+                  </span>
+                )}
+              </div>
+              {aiSpeaking && <span className="text-xs text-primary animate-pulse font-medium">Speaking question...</span>}
+            </div>
+            <p className="text-base font-medium leading-relaxed text-foreground">
+              "{currentAiQuestion}"
+            </p>
+          </div>
+
+          {/* CANDIDATE LIVE SPEECH TRANSCRIPTION DISPLAY */}
+          {currentCandidateSpeech && (
+            <div className="p-3.5 rounded-xl border border-success/30 bg-card/80 backdrop-blur-md shadow-sm">
+              <div className="flex items-center gap-2 mb-1.5">
+                <Badge className="bg-success/20 text-success border-success/30 uppercase tracking-wider text-xs font-semibold">
+                  You (Candidate)
+                </Badge>
+              </div>
+              <p className="text-sm font-normal text-foreground/90 italic">
+                "{currentCandidateSpeech}"
+              </p>
+            </div>
+          )}
+
+          {/* MEDIA HEALTH STATUS INDICATORS */}
+          <div className="flex items-center gap-2 text-xs flex-wrap px-1">
+            <Badge variant="outline" className={cn(
+              preflightCameraStatus === "ready" ? "text-success border-success/30 bg-success/5" :
+              preflightCameraStatus === "too_dark" ? "text-warning border-warning/30 bg-warning/5" : "text-muted-foreground"
+            )}>
+              Camera: {preflightCameraStatus === "ready" ? "Active" : preflightCameraStatus === "too_dark" ? "Too Dark" : "Checking"}
+            </Badge>
+            <Badge variant="outline" className={cn(
+              preflightMicStatus === "ready" ? "text-success border-success/30 bg-success/5" : "text-muted-foreground"
+            )}>
+              Microphone: {preflightMicStatus === "ready" ? "Active" : "Checking"}
+            </Badge>
+            <Badge variant="outline" className={cn(
+              preflightScreenStatus === "entire_screen" ? "text-success border-success/30 bg-success/5" :
+              preflightScreenStatus === "stopped" ? "text-destructive border-destructive/30 bg-destructive/5" : "text-warning border-warning/30"
+            )}>
+              Entire Screen: {preflightScreenStatus === "entire_screen" ? "Shared" : preflightScreenStatus === "stopped" ? "Stopped" : "Not Shared"}
+            </Badge>
+            <Badge variant="outline" className={cn(
+              interviewRecording.isRecording ? "text-destructive border-destructive/30 bg-destructive/5" : "text-muted-foreground"
+            )}>
+              Recording: {interviewRecording.isRecording ? "Active" : interviewRecording.recordingStatus}
+            </Badge>
+          </div>
+
+          {/* Voice Agent */}
           {voiceMode === "realtime" ? (
             <BhashiniVoiceAgent
               jobField={jobContext?.jobField}
@@ -1397,6 +1824,11 @@ export default function AIInterviewRoomPage() {
               onSpeakingChange={setAiSpeaking}
               onLiveCaption={(cap) => {
                 setActiveCaption(cap);
+                if (cap.speaker === "ai") {
+                  setCurrentAiQuestion(cap.text);
+                } else if (cap.speaker === "candidate") {
+                  setCurrentCandidateSpeech(cap.text);
+                }
                 if (cap.isFinal && cap.text.trim()) {
                   setTranscriptLog((prev) => [
                     ...prev,
@@ -1417,41 +1849,6 @@ export default function AIInterviewRoomPage() {
               className="flex-1 min-h-0"
             />
           )}
-
-          {/* Desktop Real-time Live Speech Captions / Subtitles Overlay */}
-          <AnimatePresence>
-            {activeCaption && activeCaption.text && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: 10 }}
-                className="p-3.5 rounded-xl border border-primary/30 bg-card/95 backdrop-blur-xl shadow-lg ring-1 ring-primary/20 shrink-0"
-              >
-                <div className="flex items-center gap-2 mb-1.5">
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      "text-xs px-2 py-0.5 uppercase tracking-wider font-semibold",
-                      activeCaption.speaker === "ai"
-                        ? "bg-primary/20 text-primary border-primary/30"
-                        : "bg-success/20 text-success border-success/30"
-                    )}
-                  >
-                    {activeCaption.speaker === "ai" ? "AI Interviewer" : "You (Candidate)"}
-                  </Badge>
-                  {activeCaption.speaker === "ai" && aiSpeaking && (
-                    <span className="flex h-2 w-2 relative">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm font-medium leading-relaxed text-foreground">
-                  "{activeCaption.text}"
-                </p>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
 
         {/* Right Panel - Workspace */}
@@ -1488,6 +1885,27 @@ export default function AIInterviewRoomPage() {
           </div>
         )}
       </div>
+
+      {/* Blocking Screen Share Interruption Modal (Part 13 & 14) */}
+      <AlertDialog open={isScreenInterrupted}>
+        <AlertDialogContent className="border-destructive/40 max-w-md">
+          <AlertDialogHeader>
+            <div className="h-12 w-12 rounded-full bg-destructive/10 flex items-center justify-center mx-auto mb-2 text-destructive">
+              <AlertTriangle className="h-6 w-6" />
+            </div>
+            <AlertDialogTitle className="text-center text-lg">Screen Sharing Stopped</AlertDialogTitle>
+            <AlertDialogDescription className="text-center">
+              Screen sharing has stopped. To maintain interview integrity, please share your <strong>ENTIRE SCREEN</strong> again to resume. Sharing an individual window or tab is not permitted.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="sm:justify-center">
+            <Button onClick={handleResumeScreenShare} variant="default" className="w-full gap-2">
+              <Monitor className="h-4 w-4" />
+              Resume Screen Sharing
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Exit Confirmation Dialog */}
       <AlertDialog open={showExitDialog} onOpenChange={setShowExitDialog}>

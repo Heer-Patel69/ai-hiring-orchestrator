@@ -2,14 +2,17 @@
  * Canonical Candidate Identity Resolution System
  * 
  * Strict resolution order:
- * 1. candidate profile full_name (from profiles.full_name or candidate_profiles.full_name)
- * 2. parsed resume fullName
- * 3. authenticated account display name
- * 4. verified email prefix as last fallback
- * 5. only if absolutely nothing exists: "Candidate"
+ * 1. candidate_profiles.full_name
+ * 2. profiles.full_name
+ * 3. parsed resume fullName
+ * 4. auth user metadata full_name / display_name
+ * 5. verified email local-part prefix as last fallback
+ * 6. "Candidate" (only when absolutely nothing exists)
  * 
  * NEVER returns random phone suffixes like "Candidate (2555)".
  */
+
+import { supabase } from "@/integrations/supabase/client";
 
 export interface CandidateIdentitySource {
   full_name?: string | null;
@@ -21,6 +24,13 @@ export interface CandidateIdentitySource {
     full_name?: string | null;
     name?: string | null;
   } | null;
+}
+
+export interface CandidateIdentityOptions {
+  profile?: CandidateIdentitySource | null;
+  candidateProfile?: CandidateIdentitySource | null;
+  resumeData?: { fullName?: string | null } | null;
+  fallbackEmail?: string | null;
 }
 
 export function formatEmailPrefix(email?: string | null): string {
@@ -40,13 +50,43 @@ export function formatEmailPrefix(email?: string | null): string {
     .join(" ");
 }
 
+/**
+ * Universal resolver: supports both options object and positional arguments.
+ * Ensures caller NEVER gets "Candidate" due to argument shape mismatch.
+ */
 export function getCandidateDisplayName(
-  profile?: CandidateIdentitySource | null,
+  profileOrOptions?: CandidateIdentitySource | CandidateIdentityOptions | null,
   candidateProfile?: CandidateIdentitySource | null,
   resumeData?: { fullName?: string | null } | null,
   fallbackEmail?: string | null
 ): string {
-  // 1. Candidate profile full_name (profiles table)
+  let profile: CandidateIdentitySource | null | undefined;
+  let candProfile: CandidateIdentitySource | null | undefined = candidateProfile;
+  let resume: { fullName?: string | null } | null | undefined = resumeData;
+  let emailFallback: string | null | undefined = fallbackEmail;
+
+  if (profileOrOptions && typeof profileOrOptions === "object") {
+    // Check if passed as an options object { profile, candidateProfile, resumeData, fallbackEmail }
+    if ("profile" in profileOrOptions || "candidateProfile" in profileOrOptions) {
+      const opts = profileOrOptions as CandidateIdentityOptions;
+      profile = opts.profile;
+      candProfile = opts.candidateProfile ?? candProfile;
+      resume = opts.resumeData ?? resume;
+      emailFallback = opts.fallbackEmail ?? emailFallback;
+    } else {
+      profile = profileOrOptions as CandidateIdentitySource;
+    }
+  }
+
+  // 1. candidate_profiles table full_name
+  if (candProfile?.full_name && typeof candProfile.full_name === "string") {
+    const trimmed = candProfile.full_name.trim();
+    if (trimmed.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+
+  // 2. profiles table full_name
   if (profile?.full_name && typeof profile.full_name === "string") {
     const trimmed = profile.full_name.trim();
     if (trimmed.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(trimmed)) {
@@ -54,36 +94,29 @@ export function getCandidateDisplayName(
     }
   }
 
-  // 1b. candidate_profiles table full_name
-  if (candidateProfile?.full_name && typeof candidateProfile.full_name === "string") {
-    const trimmed = candidateProfile.full_name.trim();
+  // 3. Parsed resume fullName
+  if (resume?.fullName && typeof resume.fullName === "string") {
+    const trimmed = resume.fullName.trim();
     if (trimmed.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(trimmed)) {
       return trimmed;
     }
   }
 
-  // 2. Parsed resume fullName
-  if (resumeData?.fullName && typeof resumeData.fullName === "string") {
-    const trimmed = resumeData.fullName.trim();
-    if (trimmed.length > 0) {
-      return trimmed;
-    }
-  }
-
-  // 3. Authenticated account display name or metadata
+  // 4. Authenticated account display name or metadata
   const metaName =
     profile?.raw_user_meta_data?.full_name ||
     profile?.raw_user_meta_data?.name ||
-    profile?.displayName;
+    profile?.displayName ||
+    profile?.name;
   if (metaName && typeof metaName === "string") {
     const trimmed = metaName.trim();
-    if (trimmed.length > 0) {
+    if (trimmed.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(trimmed)) {
       return trimmed;
     }
   }
 
-  // 4. Verified email prefix as last fallback
-  const emailCandidate = profile?.email || candidateProfile?.email || fallbackEmail;
+  // 5. Verified email prefix as last fallback
+  const emailCandidate = profile?.email || candProfile?.email || emailFallback;
   if (emailCandidate) {
     const formatted = formatEmailPrefix(emailCandidate);
     if (formatted.length > 0) {
@@ -91,7 +124,49 @@ export function getCandidateDisplayName(
     }
   }
 
-  // 5. Default fallback (NEVER a phone number slice)
+  // 6. Default fallback (NEVER a phone number slice)
+  return "Candidate";
+}
+
+/**
+ * Authoritative async resolver: queries database to resolve the real candidate name
+ * Priority: candidate_profiles -> profiles -> user metadata -> email -> "Candidate"
+ */
+export async function resolveCandidateIdentity(candidateId: string): Promise<string> {
+  if (!candidateId) return "Candidate";
+
+  try {
+    const [candProfileRes, profileRes] = await Promise.all([
+      supabase
+        .from("candidate_profiles")
+        .select("full_name")
+        .eq("user_id", candidateId)
+        .maybeSingle(),
+      supabase
+        .from("profiles")
+        .select("full_name, email")
+        .eq("user_id", candidateId)
+        .maybeSingle(),
+    ]);
+
+    const candName = candProfileRes.data?.full_name?.trim();
+    if (candName && candName.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(candName)) {
+      return candName;
+    }
+
+    const profName = profileRes.data?.full_name?.trim();
+    if (profName && profName.length > 0 && !/^Candidate\s*\(\d+\)$/i.test(profName)) {
+      return profName;
+    }
+
+    if (profileRes.data?.email) {
+      const emailName = formatEmailPrefix(profileRes.data.email);
+      if (emailName) return emailName;
+    }
+  } catch (err) {
+    console.warn("Error resolving candidate identity from database:", err);
+  }
+
   return "Candidate";
 }
 

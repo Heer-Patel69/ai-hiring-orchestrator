@@ -7,22 +7,33 @@ import { LLMProvider, llmProvider, ChatMessage } from "./llm-provider.ts";
 import { SpeechToTextProvider, TextToSpeechProvider, bhashiniSTT, bhashiniTTS } from "./bhashini-services.ts";
 
 export interface CandidateContext {
+  id?: string;
   name?: string;
+  fullName?: string;
   skills?: string[];
-  experienceYears?: number;
-  education?: string[];
-  projects?: string[];
+  experienceYears?: number | string;
+  education?: Array<string | Record<string, any>>;
+  projects?: Array<string | Record<string, any>>;
+  workExperience?: Array<string | Record<string, any>>;
   githubHighlights?: string[];
   resumeSummary?: string;
+  summary?: string;
+  location?: string;
+  github?: string;
+  linkedin?: string;
   previousScores?: Array<{ agentName: string; score: number }>;
 }
 
 export interface JobContext {
+  id?: string;
   title: string;
   field?: string;
   requiredSkills: string[];
+  preferredSkills?: string[];
   description?: string;
-  toughnessLevel?: "easy" | "medium" | "hard" | "expert";
+  responsibilities?: string[];
+  experienceLevel?: string;
+  toughnessLevel?: "easy" | "medium" | "hard" | "expert" | string;
   companyQuestions?: string[];
 }
 
@@ -34,6 +45,8 @@ export interface InterviewSessionContext {
   currentQuestionIndex?: number;
   durationSeconds?: number;
   remainingSeconds?: number;
+  roundTitle?: string;
+  roundOrder?: number;
 }
 
 export class InterviewOrchestrator {
@@ -56,11 +69,12 @@ export class InterviewOrchestrator {
    */
   public buildSystemPrompt(ctx: InterviewSessionContext): string {
     const { candidate, job, currentPhase = "technical" } = ctx;
+    const candidateDisplayName = candidate.fullName || candidate.name || "Candidate";
 
     let timeBudgetInstructions = "";
     if (ctx.durationSeconds) {
       const durationMin = Math.round(ctx.durationSeconds / 60);
-      let questionBudget = "5 to 7 concise questions";
+      let questionBudget = "5 to 7 concise questions total";
       if (ctx.durationSeconds <= 120) {
         questionBudget = "2 to 3 very concise questions total";
       } else if (ctx.durationSeconds <= 300) {
@@ -68,7 +82,7 @@ export class InterviewOrchestrator {
       }
       timeBudgetInstructions += `\nTIME MANAGEMENT & QUESTION BUDGET:
 - Configured Round Duration: ${ctx.durationSeconds} seconds (~${durationMin} min).
-- Strict Question Budget: ${questionBudget}. Do not overload the candidate with long questions.`;
+- Strict Question Budget: ${questionBudget}.`;
     }
 
     if (ctx.remainingSeconds !== undefined) {
@@ -78,45 +92,70 @@ export class InterviewOrchestrator {
       }
     }
 
-    return `You are Alex, an expert Senior Technical Interviewer conducting a live, professional interview for the role of ${job.title}.
-Your demeanor is warm, professional, encouraging, yet intellectually rigorous.
+    // Format formatted projects list
+    let formattedProjects = "None specified";
+    if (Array.isArray(candidate.projects) && candidate.projects.length > 0) {
+      formattedProjects = candidate.projects.map((p) => {
+        if (typeof p === "string") return p;
+        const name = p.name || p.title || "Project";
+        const desc = p.description ? ` (${p.description})` : "";
+        const techs = Array.isArray(p.technologies) ? ` [Tech: ${p.technologies.join(", ")}]` : "";
+        return `${name}${desc}${techs}`;
+      }).slice(0, 4).join(" | ");
+    }
 
-ROLE & REQUIREMENTS:
-- Position: ${job.title} (${job.field || "Technology"})
-- Difficulty Level: ${job.toughnessLevel || "medium"}
+    // Format work experience list
+    let formattedExperience = "None specified";
+    if (Array.isArray(candidate.workExperience) && candidate.workExperience.length > 0) {
+      formattedExperience = candidate.workExperience.map((w) => {
+        if (typeof w === "string") return w;
+        const role = w.role || w.title || "Software Engineer";
+        const company = w.company ? ` at ${w.company}` : "";
+        const desc = w.description ? ` - ${w.description.slice(0, 100)}` : "";
+        return `${role}${company}${desc}`;
+      }).slice(0, 3).join(" | ");
+    }
+
+    const summaryText = candidate.resumeSummary || candidate.summary || "";
+
+    return `You are the AI interviewer for HireMinds.
+You are interviewing ${candidateDisplayName} for the role of ${job.title}.
+
+You have access to:
+- The candidate's real parsed resume, verified skills, and project history
+- The job title, complete job description, and required skills
+- The current interview round and remaining duration
+- The previous answers given in THIS interview session
+
+POSITION & JOB REQUIREMENTS:
+- Job Title: ${job.title} (${job.field || "Technology"})
+- Difficulty / Toughness: ${job.toughnessLevel || "medium"}
 - Required Job Skills: ${job.requiredSkills.join(", ") || "Core Software Engineering"}
-${job.description ? `- Job Summary: ${job.description.slice(0, 300)}` : ""}
-${job.companyQuestions?.length ? `- Mandatory Company Assessment Questions: ${job.companyQuestions.join(" | ")}` : ""}
+${job.preferredSkills?.length ? `- Preferred Skills: ${job.preferredSkills.join(", ")}` : ""}
+${job.description ? `- Complete Job Description: ${job.description.slice(0, 500)}` : ""}
+${job.responsibilities?.length ? `- Key Responsibilities: ${job.responsibilities.slice(0, 3).join("; ")}` : ""}
+${job.companyQuestions?.length ? `- Mandatory Company Questions: ${job.companyQuestions.join(" | ")}` : ""}
 
 CANDIDATE DOSSIER:
-- Candidate Name: ${candidate.name || "Candidate"}
-- Experience: ${candidate.experienceYears !== undefined ? `${candidate.experienceYears} years` : "Not specified"}
+- Candidate Name: ${candidateDisplayName}
+- Experience Level: ${candidate.experienceYears ? `${candidate.experienceYears} years` : "Not specified"}
 - Verified Candidate Skills: ${candidate.skills?.join(", ") || "Technical background"}
-${candidate.projects?.length ? `- Candidate Notable Projects: ${candidate.projects.slice(0, 3).join("; ")}` : ""}
-${candidate.githubHighlights?.length ? `- GitHub Highlights: ${candidate.githubHighlights.slice(0, 2).join("; ")}` : ""}
-${candidate.resumeSummary ? `- Resume Summary: ${candidate.resumeSummary.slice(0, 250)}` : ""}
+- Candidate Projects: ${formattedProjects}
+- Work Experience History: ${formattedExperience}
+${summaryText ? `- Professional Summary: ${summaryText.slice(0, 300)}` : ""}
 ${timeBudgetInstructions}
 
 CURRENT INTERVIEW PHASE: ${currentPhase.toUpperCase()}
 
-CORE INTERVIEWER DIRECTIVES (STRICT COMPLIANCE REQUIRED):
-1. Ask exactly ONE question at a time.
-2. Keep spoken responses concise (2 to 3 sentences maximum) so the candidate can speak.
-3. Do NOT lecture, monologue, or explain concepts unprompted.
-4. Do NOT reveal the correct answers or give away solutions during the interview.
-5. Do NOT disclose internal scores, evaluation percentages, or grading metrics to the candidate.
-6. Ask adaptive follow-up questions:
-   - If the candidate gives a strong answer: probe deeper into edge cases, internals, or scalability trade-offs.
-   - If the candidate gives an incomplete or vague answer: ask for specific clarification or a concrete example.
-   - If the candidate mentions a specific tool or project from their experience: bridge to that experience with a relevant technical question.
-   - If the candidate struggles heavily: provide a gentle nudge or shift gracefully without demoralizing them.
-7. Avoid repeating questions or covering topics already addressed in previous turns.
-8. Stay strictly relevant to the job requirements and candidate technical background.
-9. Sound conversational, natural, and human.
-10. NEVER state that you are an AI model, LLM, Groq, or mention any internal APIs or infrastructure.
-11. If the candidate gives a very short, unclear, or silent response, politely say: "I couldn't catch that clearly. Could you elaborate on that?"
-12. NEVER hallucinate or invent candidate experience, companies, or degrees that are not explicitly present in the candidate dossier.
-13. When asking coding challenges, describe the problem simply in 2 sentences and instruct the candidate to explain their thought process.`;
+INTERVIEW QUESTION STRATEGY & DIRECTIVES:
+1. NEVER ASK GENERIC QUESTIONS like "Tell me about yourself" when resume-specific or job-specific questions are available.
+2. ASK RESUME-SPECIFIC QUESTIONS: Directly reference projects, tools, or architectures claimed in the candidate's resume (e.g. "I noticed you built ${formattedProjects.split(" | ")[0] || "a project"}. How did you structure that application and handle state management?").
+3. ASK INTELLIGENT FOLLOW-UPS: Analyze the candidate's previous response in THIS session. If they answered X, probe into how they handled failure cases, edge cases, security, or performance trade-offs.
+4. ASK ONE QUESTION AT A TIME. Keep spoken responses concise (2 to 3 sentences maximum) so the candidate can answer.
+5. DO NOT lecture, explain concepts unprompted, or give away the solution.
+6. DO NOT disclose internal scoring logic, ratings, or grading percentages.
+7. NEVER invent or hallucinate candidate claims, companies, or degrees not in the candidate dossier.
+8. Adapt to the remaining time: keep questions focused and do not start a long new question when less than 30 seconds remain.`;
   }
 
   /**
@@ -124,16 +163,17 @@ CORE INTERVIEWER DIRECTIVES (STRICT COMPLIANCE REQUIRED):
    */
   public async generateOpening(ctx: InterviewSessionContext): Promise<string> {
     const systemPrompt = this.buildSystemPrompt(ctx);
-    const userPrompt = `Generate a warm, professional opening greeting for ${ctx.candidate.name || "the candidate"}.
-Briefly introduce yourself as the interviewer for the ${ctx.job.title} position, make them feel at ease, and ask the first focused technical icebreaker question related to ${ctx.job.requiredSkills[0] || "their background"}.
-Keep your response to 2-3 spoken sentences max.`;
+    const candidateName = ctx.candidate.fullName || ctx.candidate.name || "there";
+    const userPrompt = `Generate a warm, professional opening greeting for ${candidateName}.
+Briefly introduce yourself as the interviewer for the ${ctx.job.title} position, make them feel comfortable, and ask the first focused technical question directly referencing their relevant background or required skill (${ctx.job.requiredSkills[0] || "their technical experience"}).
+Keep your response to 2-3 spoken sentences maximum.`;
 
     const response = await this.llm.chat({
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.6,
+      temperature: 0.5,
       maxTokens: 150,
     });
 
@@ -151,7 +191,7 @@ Keep your response to 2-3 spoken sentences max.`;
     // 1. STT
     let transcript = await this.stt.transcribe(audioBase64, language);
     if (!transcript || transcript.trim().length === 0) {
-      const fallbackReply = "Sorry, I couldn't hear that clearly. Could you repeat your answer?";
+      const fallbackReply = "I couldn't hear that clearly. Could you please repeat your answer?";
       const audioReply = await this.tts.synthesize(fallbackReply, language);
       return {
         transcript: "",
@@ -160,47 +200,30 @@ Keep your response to 2-3 spoken sentences max.`;
       };
     }
 
-    // 2. Add to conversation history
-    const conversationMessages: ChatMessage[] = [
-      { role: "system", content: this.buildSystemPrompt(ctx) },
-      ...ctx.history.map((h) => ({ role: h.role, content: h.content })),
-      { role: "user", content: transcript },
-    ];
-
-    // 3. Groq LLM Turn
-    const llmRes = await this.llm.chat({
-      messages: conversationMessages,
-      temperature: 0.5,
-      maxTokens: 180,
-    });
-
-    const replyText = llmRes.content.trim();
-
-    // 4. TTS
-    const audioReply = await this.tts.synthesize(replyText, language);
-
-    return {
-      transcript,
-      replyText,
-      audioBase64: audioReply,
-    };
-  }
-
-  /**
-   * Generates a stream of responses for low-latency live web client
-   */
-  public async streamInterviewResponse(ctx: InterviewSessionContext): Promise<ReadableStream<Uint8Array>> {
+    // 2. Add to history & generate next question
     const systemPrompt = this.buildSystemPrompt(ctx);
     const messages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
       ...ctx.history.map((h) => ({ role: h.role, content: h.content })),
+      { role: "user", content: transcript },
     ];
 
-    return await this.llm.chatStream({
+    const response = await this.llm.chat({
       messages,
       temperature: 0.4,
-      maxTokens: 250,
+      maxTokens: 200,
     });
+
+    const replyText = response.content.trim();
+
+    // 3. TTS
+    const audioBase64Reply = await this.tts.synthesize(replyText, language);
+
+    return {
+      transcript,
+      replyText,
+      audioBase64: audioBase64Reply,
+    };
   }
 }
 

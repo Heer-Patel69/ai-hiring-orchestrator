@@ -21,6 +21,7 @@ interface VideoPanelProps {
   remainingTime: number;
   aiSpeaking: boolean;
   className?: string;
+  mediaStream?: MediaStream | null;
 }
 
 export function VideoPanel({
@@ -29,6 +30,7 @@ export function VideoPanel({
   remainingTime,
   aiSpeaking,
   className,
+  mediaStream,
 }: VideoPanelProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -37,15 +39,25 @@ export function VideoPanel({
   const [cameraError, setCameraError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (mediaStream) {
+      setStream(mediaStream);
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+      }
+      return;
+    }
+
+    let activeStream: MediaStream | null = null;
     const initCamera = async () => {
       try {
-        const mediaStream = await navigator.mediaDevices.getUserMedia({
+        const ms = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true,
         });
-        setStream(mediaStream);
+        activeStream = ms;
+        setStream(ms);
         if (videoRef.current) {
-          videoRef.current.srcObject = mediaStream;
+          videoRef.current.srcObject = ms;
         }
       } catch (error) {
         console.error("Camera error:", error);
@@ -56,9 +68,11 @@ export function VideoPanel({
     initCamera();
 
     return () => {
-      stream?.getTracks().forEach((track) => track.stop());
+      if (!mediaStream && activeStream) {
+        activeStream.getTracks().forEach((track) => track.stop());
+      }
     };
-  }, []);
+  }, [mediaStream]);
 
   const toggleVideo = useCallback(() => {
     if (stream) {

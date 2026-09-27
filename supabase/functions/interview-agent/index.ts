@@ -19,7 +19,7 @@ interface InterviewRequest {
   durationSeconds?: number;
   remainingSeconds?: number;
   jobField?: string;
-  toughnessLevel?: "easy" | "medium" | "hard" | "expert";
+  toughnessLevel?: "easy" | "medium" | "hard" | "expert" | string;
   customQuestions?: string[];
   currentQuestionIndex?: number;
   candidateScore?: number;
@@ -58,10 +58,8 @@ serve(async (req) => {
       toughnessLevel = "medium",
       customQuestions = [],
       currentQuestionIndex,
-      candidateScore,
       jobTitle = "Software Engineer",
       requiredSkills = [],
-      experienceLevel,
       candidateName,
       candidateSkills = [],
       resumeSummary,
@@ -72,20 +70,50 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     let authoritativeRemaining = remainingSeconds;
+    let resolvedCandidateName = candidateName;
+    let resolvedCandidateSkills = candidateSkills;
+    let resolvedProjects: any[] = [];
+    let resolvedExperience: any[] = [];
+    let resolvedResumeSummary = resumeSummary;
+    let resolvedEducation: any[] = [];
+    let resolvedJobTitle = jobTitle;
+    let resolvedJobDescription = "";
+    let resolvedRequiredSkills = requiredSkills;
+    let resolvedResponsibilities: string[] = [];
+    let resolvedField = jobField;
+    let resolvedToughness = toughnessLevel;
+    let resolvedRoundNumber = 1;
 
-    // Check server-authoritative timer if applicationId provided
+    // Load server-authoritative application, candidate, job, and round context
     if (applicationId) {
-      const { data: app } = await supabase
+      const now = Date.now();
+
+      const { data: appData, error: appError } = await supabase
         .from("applications")
-        .select("started_at, duration_seconds, expires_at, status")
+        .select(`
+          id,
+          candidate_id,
+          job_id,
+          current_round,
+          started_at,
+          duration_seconds,
+          expires_at,
+          status,
+          interview_context_snapshot,
+          jobs(id, title, description, field, requirements, responsibilities, toughness_level, experience_level)
+        `)
         .eq("id", applicationId)
         .maybeSingle();
 
-      const now = Date.now();
+      if (appError) {
+        console.warn("[interview-agent] Error fetching application context:", appError);
+      }
 
-      if (app) {
-        if (!app.started_at || !app.expires_at) {
-          // Initialize server timer on first turn
+      if (appData) {
+        resolvedRoundNumber = (appData.current_round || 0) + 1;
+
+        // Server-enforced countdown timer check & initialization
+        if (!appData.started_at || !appData.expires_at) {
           const startedAt = new Date(now).toISOString();
           const expiresAt = new Date(now + durationSeconds * 1000).toISOString();
           await supabase
@@ -100,15 +128,12 @@ serve(async (req) => {
 
           authoritativeRemaining = durationSeconds;
         } else {
-          // Calculate remaining seconds strictly from server timestamp
-          const expiryTime = new Date(app.expires_at).getTime();
+          const expiryTime = new Date(appData.expires_at).getTime();
           authoritativeRemaining = Math.max(0, Math.floor((expiryTime - now) / 1000));
 
-          // If expired, reject new question and end interview
           if (now >= expiryTime) {
             const closingText = "Our scheduled interview time has concluded. Thank you for taking the time to speak with me today. Your responses have been submitted for evaluation.";
-            
-            // Persist closing transcript
+
             await supabase.from("interview_transcripts").insert({
               application_id: applicationId,
               role: "ai",
@@ -129,18 +154,145 @@ serve(async (req) => {
             );
           }
         }
-      }
 
-      // Persist the candidate's latest message to transcript
-      const latestUserMsg = [...messages].reverse().find(m => m.role === "user");
-      if (latestUserMsg) {
-        await supabase.from("interview_transcripts").insert({
-          application_id: applicationId,
-          role: "candidate",
-          content: latestUserMsg.content,
-          phase: "technical",
-          timestamp_ms: now,
-        });
+        // Persist candidate message to transcript
+        const latestUserMsg = [...messages].reverse().find(m => m.role === "user");
+        if (latestUserMsg && latestUserMsg.content.trim()) {
+          await supabase.from("interview_transcripts").insert({
+            application_id: applicationId,
+            role: "candidate",
+            content: latestUserMsg.content.trim(),
+            phase: `round_${resolvedRoundNumber}`,
+            timestamp_ms: now,
+          });
+        }
+
+        // Load or restore authoritative Interview Context Snapshot
+        if (appData.interview_context_snapshot && typeof appData.interview_context_snapshot === "object") {
+          const snap = appData.interview_context_snapshot as any;
+          if (snap.candidate?.fullName) resolvedCandidateName = snap.candidate.fullName;
+          if (snap.candidate?.skills?.length) resolvedCandidateSkills = snap.candidate.skills;
+          if (snap.candidate?.projects?.length) resolvedProjects = snap.candidate.projects;
+          if (snap.candidate?.workExperience?.length) resolvedExperience = snap.candidate.workExperience;
+          if (snap.candidate?.summary) resolvedResumeSummary = snap.candidate.summary;
+          if (snap.candidate?.education) resolvedEducation = snap.candidate.education;
+
+          if (snap.job?.title) resolvedJobTitle = snap.job.title;
+          if (snap.job?.description) resolvedJobDescription = snap.job.description;
+          if (snap.job?.requiredSkills?.length) resolvedRequiredSkills = snap.job.requiredSkills;
+          if (snap.job?.responsibilities?.length) resolvedResponsibilities = snap.job.responsibilities;
+          if (snap.job?.field) resolvedField = snap.job.field;
+          if (snap.job?.toughnessLevel) resolvedToughness = snap.job.toughnessLevel;
+        } else {
+          // Fetch candidate profile, user profile, and round details
+          const [candProfileRes, profileRes, jobRoundRes] = await Promise.all([
+            supabase
+              .from("candidate_profiles")
+              .select("full_name, summary, skills, technical_skills, work_experience, projects, education, certifications, experience_years, github_url, linkedin_url, location")
+              .eq("user_id", appData.candidate_id)
+              .maybeSingle(),
+            supabase
+              .from("profiles")
+              .select("full_name, email")
+              .eq("user_id", appData.candidate_id)
+              .maybeSingle(),
+            supabase
+              .from("job_rounds")
+              .select("round_type, duration_minutes, passing_score")
+              .eq("job_id", appData.job_id)
+              .eq("round_number", resolvedRoundNumber)
+              .maybeSingle(),
+          ]);
+
+          const cand = candProfileRes.data;
+          const prof = profileRes.data;
+          const job = appData.jobs as any;
+
+          resolvedCandidateName =
+            cand?.full_name?.trim() ||
+            prof?.full_name?.trim() ||
+            (prof?.email ? prof.email.split("@")[0] : undefined) ||
+            candidateName ||
+            "Candidate";
+
+          resolvedCandidateSkills =
+            (Array.isArray(cand?.skills) && cand.skills.length > 0 ? cand.skills : undefined) ||
+            (Array.isArray(cand?.technical_skills) && cand.technical_skills.length > 0 ? cand.technical_skills : undefined) ||
+            candidateSkills;
+
+          resolvedProjects = Array.isArray(cand?.projects) ? cand.projects : [];
+          resolvedExperience = Array.isArray(cand?.work_experience) ? cand.work_experience : [];
+          resolvedResumeSummary = cand?.summary || resumeSummary || "";
+          resolvedEducation = Array.isArray(cand?.education) ? cand.education : [];
+
+          if (job) {
+            resolvedJobTitle = job.title || resolvedJobTitle;
+            resolvedJobDescription = job.description || "";
+            resolvedField = job.field || resolvedField;
+            resolvedToughness = job.toughness_level ? String(job.toughness_level) : resolvedToughness;
+            if (Array.isArray(job.requirements) && job.requirements.length > 0) {
+              resolvedRequiredSkills = job.requirements;
+            }
+            if (Array.isArray(job.responsibilities)) {
+              resolvedResponsibilities = job.responsibilities;
+            }
+          }
+
+          // Build and persist snapshot
+          const snapshot = {
+            candidate: {
+              id: appData.candidate_id,
+              fullName: resolvedCandidateName,
+              summary: resolvedResumeSummary,
+              location: cand?.location || "",
+              experienceYears: cand?.experience_years,
+              skills: resolvedCandidateSkills,
+              workExperience: resolvedExperience,
+              projects: resolvedProjects,
+              education: resolvedEducation,
+              github: cand?.github_url || "",
+              linkedin: cand?.linkedin_url || "",
+            },
+            job: {
+              id: appData.job_id,
+              title: resolvedJobTitle,
+              description: resolvedJobDescription,
+              requiredSkills: resolvedRequiredSkills,
+              responsibilities: resolvedResponsibilities,
+              field: resolvedField,
+              toughnessLevel: resolvedToughness,
+            },
+            round: {
+              number: resolvedRoundNumber,
+              type: jobRoundRes.data?.round_type || "Technical Screening",
+              durationMinutes: jobRoundRes.data?.duration_minutes,
+              passingScore: jobRoundRes.data?.passing_score || 60,
+            },
+            createdAt: new Date().toISOString(),
+          };
+
+          try {
+            await supabase
+              .from("applications")
+              .update({ interview_context_snapshot: snapshot })
+              .eq("id", applicationId);
+          } catch (snapErr) {
+            console.warn("Failed to persist interview context snapshot:", snapErr);
+          }
+        }
+
+        // Context telemetry log (PART 17)
+        console.log(`[interview-agent] Interview context initialized:
+  sessionId: ${applicationId}
+  candidateId: ${appData.candidate_id}
+  candidateNameResolved: ${!!resolvedCandidateName && resolvedCandidateName !== "Candidate"} (${resolvedCandidateName})
+  resumeLoaded: ${!!(resolvedCandidateSkills?.length || resolvedProjects?.length || resolvedExperience?.length)}
+  projectsCount: ${resolvedProjects?.length || 0}
+  workExpCount: ${resolvedExperience?.length || 0}
+  jobTitleLoaded: ${!!resolvedJobTitle} (${resolvedJobTitle})
+  jobDescriptionLoaded: ${!!resolvedJobDescription}
+  requiredSkillsCount: ${resolvedRequiredSkills?.length || 0}
+  roundLoaded: true (Round ${resolvedRoundNumber})`);
       }
     }
 
@@ -150,21 +302,28 @@ serve(async (req) => {
     // Build rich, structured context with server timer constraints
     const ctx: InterviewSessionContext = {
       candidate: {
-        name: candidateName,
-        skills: candidateSkills.length > 0 ? candidateSkills : requiredSkills,
-        resumeSummary,
+        name: resolvedCandidateName,
+        fullName: resolvedCandidateName,
+        skills: resolvedCandidateSkills.length > 0 ? resolvedCandidateSkills : resolvedRequiredSkills,
+        resumeSummary: resolvedResumeSummary,
+        projects: resolvedProjects,
+        workExperience: resolvedExperience,
+        education: resolvedEducation,
       },
       job: {
-        title: jobTitle,
-        field: jobField,
-        requiredSkills: requiredSkills.length > 0 ? requiredSkills : [jobField],
-        toughnessLevel: toughnessLevel,
+        title: resolvedJobTitle,
+        field: resolvedField,
+        requiredSkills: resolvedRequiredSkills.length > 0 ? resolvedRequiredSkills : [resolvedField],
+        description: resolvedJobDescription,
+        responsibilities: resolvedResponsibilities,
+        toughnessLevel: resolvedToughness,
         companyQuestions: customQuestions,
       },
       history: messages.map((m) => ({ role: m.role, content: m.content })),
       currentQuestionIndex,
       durationSeconds,
       remainingSeconds: authoritativeRemaining,
+      roundOrder: resolvedRoundNumber,
     };
 
     let systemPrompt = interviewOrchestrator.buildSystemPrompt(ctx);

@@ -1,10 +1,27 @@
 import { useCallback, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
+export type ProctoringEventType =
+  | "face_detected"
+  | "face_not_visible"
+  | "multiple_faces"
+  | "looking_away"
+  | "tab_switch"
+  | "copy_paste"
+  | "audio_anomaly"
+  | "suspicious_movement"
+  | "recording_started"
+  | "recording_stopped"
+  | "camera_blocked"
+  | "camera_too_dark"
+  | "screen_share_detected"
+  | "screen_share_started"
+  | "screen_share_stopped"
+  | "screen_share_wrong_surface"
+  | "screen_share_restored";
+
 export interface ProctoringEvent {
-  type: "face_detected" | "face_not_visible" | "multiple_faces" | "looking_away" | 
-        "tab_switch" | "copy_paste" | "audio_anomaly" | "suspicious_movement" | 
-        "recording_started" | "recording_stopped" | "camera_blocked" | "screen_share_detected";
+  type: ProctoringEventType;
   timestamp: Date;
   severity: "low" | "medium" | "high" | "critical";
   description: string;
@@ -28,6 +45,7 @@ export function useProctoringLogger({
   flushInterval = 5000,
 }: UseProctoringLoggerOptions) {
   const eventBuffer = useRef<ProctoringEvent[]>([]);
+  const lastLoggedTimes = useRef<Map<string, number>>(new Map());
   const flushTimerRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<Date | null>(null);
 
@@ -56,12 +74,12 @@ export function useProctoringLogger({
         .insert(logsToInsert);
 
       if (error) {
-        console.error("Failed to log proctoring events:", error);
+        console.warn("Failed to log proctoring events:", error);
         // Put events back in buffer for retry
         eventBuffer.current = [...eventsToFlush, ...eventBuffer.current];
       }
     } catch (error) {
-      console.error("Error flushing proctoring events:", error);
+      console.warn("Error flushing proctoring events:", error);
       eventBuffer.current = [...eventsToFlush, ...eventBuffer.current];
     }
   }, [applicationId, recordingId, candidateId]);
@@ -77,13 +95,41 @@ export function useProctoringLogger({
     }
   };
 
+  // Log a single event with deduplication to prevent React render spam
+  const logEvent = useCallback((event: ProctoringEvent) => {
+    const now = Date.now();
+    const eventKey = `${event.type}:${event.description}`;
+    const lastTime = lastLoggedTimes.current.get(eventKey) || 0;
+
+    // Suppress identical events that occurred within the last 6 seconds
+    if (now - lastTime < 6000) {
+      return;
+    }
+    lastLoggedTimes.current.set(eventKey, now);
+
+    // Calculate timestamp in video
+    const timestampInVideo = startTimeRef.current
+      ? Math.floor((event.timestamp.getTime() - startTimeRef.current.getTime()) / 1000)
+      : undefined;
+
+    eventBuffer.current.push({
+      ...event,
+      timestampInVideo,
+    });
+
+    // Flush if buffer is full
+    if (eventBuffer.current.length >= batchSize) {
+      void flushEvents();
+    }
+  }, [batchSize, flushEvents]);
+
   // Start logging session
   const startLogging = useCallback(() => {
     startTimeRef.current = new Date();
     
     // Set up periodic flush
     flushTimerRef.current = setInterval(() => {
-      flushEvents();
+      void flushEvents();
     }, flushInterval);
 
     // Log recording start
@@ -93,7 +139,7 @@ export function useProctoringLogger({
       severity: "low",
       description: "Interview recording and monitoring started",
     });
-  }, [flushEvents, flushInterval]);
+  }, [flushEvents, flushInterval, logEvent]);
 
   // Stop logging session
   const stopLogging = useCallback(async () => {
@@ -112,29 +158,11 @@ export function useProctoringLogger({
     }
 
     await flushEvents();
-  }, [flushEvents]);
-
-  // Log a single event
-  const logEvent = useCallback((event: ProctoringEvent) => {
-    // Calculate timestamp in video
-    const timestampInVideo = startTimeRef.current
-      ? Math.floor((event.timestamp.getTime() - startTimeRef.current.getTime()) / 1000)
-      : undefined;
-
-    eventBuffer.current.push({
-      ...event,
-      timestampInVideo,
-    });
-
-    // Flush if buffer is full
-    if (eventBuffer.current.length >= batchSize) {
-      flushEvents();
-    }
-  }, [batchSize, flushEvents]);
+  }, [flushEvents, logEvent]);
 
   // Log camera activity detection
   const logCameraActivity = useCallback((
-    activityType: "face_detected" | "face_not_visible" | "multiple_faces" | "looking_away" | "camera_blocked",
+    activityType: "face_detected" | "face_not_visible" | "multiple_faces" | "looking_away" | "camera_blocked" | "camera_too_dark",
     details?: string
   ) => {
     const severityMap: Record<string, "low" | "medium" | "high" | "critical"> = {
@@ -143,13 +171,14 @@ export function useProctoringLogger({
       multiple_faces: "high",
       looking_away: "medium",
       camera_blocked: "high",
+      camera_too_dark: "high",
     };
 
     logEvent({
       type: activityType,
       timestamp: new Date(),
       severity: severityMap[activityType] || "medium",
-      description: details || `Camera activity: ${activityType.replace(/_/g, " ")}`,
+      description: details || `Camera status: ${activityType.replace(/_/g, " ")}`,
     });
   }, [logEvent]);
 

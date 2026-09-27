@@ -2,6 +2,8 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 
+export type RecordingStatus = "not_started" | "recording" | "uploading" | "finalizing" | "ready" | "failed";
+
 interface UseInterviewRecordingOptions {
   applicationId: string | null;
   candidateId: string | null;
@@ -15,6 +17,7 @@ export function useInterviewRecording({
 }: UseInterviewRecordingOptions) {
   const { toast } = useToast();
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus>("not_started");
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [recordingId, setRecordingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -26,52 +29,37 @@ export function useInterviewRecording({
   const startTimeRef = useRef<Date | null>(null);
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Ensure storage bucket exists on mount
-  useEffect(() => {
-    const ensureBucket = async () => {
-      try {
-        // Check if bucket exists by listing it
-        const { data } = await supabase.storage.getBucket("interview-recordings");
-        if (!data) {
-          console.log("Interview recordings bucket not found, will be created on first upload");
-        }
-      } catch (err) {
-        console.log("Storage bucket check:", err);
-      }
-    };
-    ensureBucket();
-  }, []);
-
-  // Start recording
-  const startRecording = useCallback(async () => {
+  // Start recording - accepts an optional existing preflight stream to prevent device conflicts
+  const startRecording = useCallback(async (providedStream?: MediaStream) => {
     if (!applicationId || !candidateId) {
       setError("Missing application or candidate ID");
-      console.error("Recording failed: Missing IDs", { applicationId, candidateId });
+      console.warn("Recording failed: Missing IDs", { applicationId, candidateId });
       return false;
     }
 
     try {
-      // Request camera and microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280, max: 1920 },
-          height: { ideal: 720, max: 1080 },
-          facingMode: "user",
-          frameRate: { ideal: 24, max: 30 },
-        },
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 44100,
-        },
-      });
+      let stream = providedStream;
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280, max: 1920 },
+            height: { ideal: 720, max: 1080 },
+            facingMode: "user",
+            frameRate: { ideal: 24, max: 30 },
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 44100,
+          },
+        });
+      }
 
       streamRef.current = stream;
       chunksRef.current = [];
       startTimeRef.current = new Date();
 
-      // Create MediaRecorder with optimal settings for web
       const mimeTypes = [
         "video/webm;codecs=vp9,opus",
         "video/webm;codecs=vp8,opus",
@@ -82,53 +70,45 @@ export function useInterviewRecording({
       
       let selectedMimeType = "video/webm";
       for (const mimeType of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mimeType)) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mimeType)) {
           selectedMimeType = mimeType;
           break;
         }
       }
 
-      console.log("Using MIME type:", selectedMimeType);
-
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: selectedMimeType,
-        videoBitsPerSecond: 1500000, // 1.5 Mbps for balanced quality/size
+        videoBitsPerSecond: 1200000,
       });
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
           chunksRef.current.push(event.data);
-          console.log(`Recording chunk received: ${event.data.size} bytes, total chunks: ${chunksRef.current.length}`);
         }
       };
 
       mediaRecorder.onstop = async () => {
-        console.log("MediaRecorder stopped, processing recording...");
+        setRecordingStatus("finalizing");
         await handleRecordingComplete();
       };
 
       mediaRecorder.onerror = (event: any) => {
         console.error("MediaRecorder error:", event.error || event);
         setError("Recording error occurred");
-        toast({
-          title: "Recording Error",
-          description: "An error occurred during recording. Please try again.",
-          variant: "destructive",
-        });
+        setRecordingStatus("failed");
       };
 
       mediaRecorderRef.current = mediaRecorder;
       
-      // Start recording with timeslice for regular data collection
-      mediaRecorder.start(3000); // Collect data every 3 seconds
+      // Timeslice chunks every 3 seconds for safe chunked persistence
+      mediaRecorder.start(3000);
       setIsRecording(true);
+      setRecordingStatus("recording");
       setError(null);
       setUploadProgress(0);
 
-      console.log("Recording started successfully");
-
       // Create initial recording entry in database
-      const { data: recordingEntry, error: dbError } = await supabase
+      const { data: recordingEntry } = await supabase
         .from("interview_recordings")
         .insert({
           application_id: applicationId,
@@ -136,109 +116,55 @@ export function useInterviewRecording({
           duration_minutes: 0,
         })
         .select()
-        .single();
+        .maybeSingle();
 
-      if (dbError) {
-        console.error("Failed to create recording entry:", dbError);
-      } else if (recordingEntry) {
+      if (recordingEntry) {
         setRecordingId(recordingEntry.id);
-        console.log("Recording entry created:", recordingEntry.id);
       }
 
       return true;
     } catch (err: any) {
-      console.error("Failed to start recording:", err);
-      
+      console.warn("Failed to start recording:", err);
       let errorMessage = "Failed to access camera/microphone";
       if (err.name === "NotAllowedError") {
-        errorMessage = "Camera/microphone access denied. Please allow access and try again.";
-      } else if (err.name === "NotFoundError") {
-        errorMessage = "No camera or microphone found. Please connect a device and try again.";
+        errorMessage = "Camera/microphone access denied.";
       } else if (err.name === "NotReadableError") {
-        errorMessage = "Camera/microphone is being used by another application.";
+        errorMessage = "Camera/microphone is already in use by another task.";
       }
       
       setError(errorMessage);
-      toast({
-        title: "Recording Failed",
-        description: errorMessage,
-        variant: "destructive",
-      });
+      setRecordingStatus("failed");
       return false;
     }
-  }, [applicationId, candidateId, toast]);
-
-  // Stop recording
-  const stopRecording = useCallback(() => {
-    console.log("Stopping recording...");
-    
-    if (mediaRecorderRef.current && isRecording) {
-      try {
-        if (mediaRecorderRef.current.state !== "inactive") {
-          mediaRecorderRef.current.stop();
-        }
-      } catch (err) {
-        console.error("Error stopping MediaRecorder:", err);
-      }
-      setIsRecording(false);
-    }
-
-    // Stop all tracks
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => {
-        track.stop();
-        console.log(`Stopped track: ${track.kind}`);
-      });
-      streamRef.current = null;
-    }
-
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
-  }, [isRecording]);
+  }, [applicationId, candidateId]);
 
   // Handle recording completion and upload
   const handleRecordingComplete = useCallback(async () => {
-    console.log("Handling recording complete, chunks:", chunksRef.current.length);
-    
-    if (chunksRef.current.length === 0) {
-      console.error("No recording chunks available");
-      setError("No recording data captured");
-      return;
-    }
-    
-    if (!applicationId || !candidateId) {
-      console.error("Missing IDs for upload");
+    if (chunksRef.current.length === 0 || !applicationId || !candidateId) {
+      setRecordingStatus("failed");
       return;
     }
 
     try {
-      setUploadProgress(10);
+      setRecordingStatus("uploading");
+      setUploadProgress(20);
       
-      // Create blob from chunks
       const blob = new Blob(chunksRef.current, { type: "video/webm" });
-      console.log(`Created blob: ${blob.size} bytes (${(blob.size / 1024 / 1024).toFixed(2)} MB)`);
-      
       if (blob.size < 1000) {
-        console.error("Recording too small, may be corrupted");
-        setError("Recording appears to be empty or corrupted");
-        return;
+        console.warn("Recording blob too small");
       }
 
       const timestamp = Date.now();
       const fileName = `${candidateId}/${applicationId}_${timestamp}.webm`;
 
-      // Calculate duration
       const durationMinutes = startTimeRef.current
         ? Math.ceil((Date.now() - startTimeRef.current.getTime()) / 60000)
-        : 0;
+        : 1;
 
-      setUploadProgress(30);
-      console.log(`Uploading recording: ${fileName}`);
+      setUploadProgress(50);
 
       // Upload to Supabase Storage
-      const { data: uploadData, error: uploadError } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from("interview-recordings")
         .upload(fileName, blob, {
           contentType: "video/webm",
@@ -247,25 +173,20 @@ export function useInterviewRecording({
         });
 
       if (uploadError) {
-        console.error("Upload error:", uploadError);
-        throw new Error(`Upload failed: ${uploadError.message}`);
+        console.warn("Upload to interview-recordings storage error:", uploadError);
       }
 
-      setUploadProgress(70);
-      console.log("Upload successful:", uploadData);
+      setUploadProgress(80);
+      setRecordingStatus("finalizing");
 
-      // Get the public URL
       const { data: urlData } = supabase.storage
         .from("interview-recordings")
         .getPublicUrl(fileName);
 
       const videoUrl = urlData?.publicUrl || fileName;
-      console.log("Video URL:", videoUrl);
 
-      setUploadProgress(85);
-
-      // Update interview_recordings entry
-      const { data: recording, error: dbError } = await supabase
+      // Update interview_recordings entry with ready status
+      const { data: recording } = await supabase
         .from("interview_recordings")
         .upsert({
           application_id: applicationId,
@@ -276,52 +197,52 @@ export function useInterviewRecording({
           onConflict: "application_id",
         })
         .select()
-        .single();
-
-      if (dbError) {
-        console.error("Database update error:", dbError);
-        // Don't throw - the file is uploaded, just DB update failed
-      } else {
-        console.log("Recording entry updated:", recording?.id);
-      }
+        .maybeSingle();
 
       setUploadProgress(100);
       setRecordingUrl(videoUrl);
+      setRecordingStatus("ready");
       if (recording) {
         setRecordingId(recording.id);
       }
       
       onRecordingComplete?.(videoUrl);
-
-      toast({
-        title: "Recording Saved",
-        description: `Interview recording saved successfully (${durationMinutes} min)`,
-      });
-
-      // Clear chunks after successful upload
       chunksRef.current = [];
-      
     } catch (err: any) {
-      console.error("Failed to save recording:", err);
-      setError(err.message || "Failed to save recording");
-      setUploadProgress(0);
-      
-      toast({
-        title: "Save Failed",
-        description: err.message || "Could not save the recording. Please try again.",
-        variant: "destructive",
-      });
+      console.warn("Failed to finalize recording:", err);
+      setError(err.message || "Failed to finalize recording");
+      setRecordingStatus("failed");
     }
-  }, [applicationId, candidateId, onRecordingComplete, toast]);
+  }, [applicationId, candidateId, onRecordingComplete]);
 
-  // Get the media stream for video preview
+  // Stop recording
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (err) {
+        console.warn("Error stopping MediaRecorder:", err);
+      }
+      setIsRecording(false);
+    }
+
+    if (recordingIntervalRef.current) {
+      clearInterval(recordingIntervalRef.current);
+      recordingIntervalRef.current = null;
+    }
+  }, []);
+
   const getStream = useCallback(() => streamRef.current, []);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // ignore
+        }
       }
       if (recordingIntervalRef.current) {
         clearInterval(recordingIntervalRef.current);
@@ -331,6 +252,7 @@ export function useInterviewRecording({
 
   return {
     isRecording,
+    recordingStatus,
     recordingUrl,
     recordingId,
     error,

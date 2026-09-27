@@ -6,12 +6,13 @@
 ALTER TYPE public.application_status ADD VALUE IF NOT EXISTS 'completed';
 ALTER TYPE public.application_status ADD VALUE IF NOT EXISTS 'assessment_in_progress';
 
--- 2. Add server-enforced timer columns to applications
+-- 2. Add server-enforced timer columns and context snapshot to applications
 ALTER TABLE public.applications
 ADD COLUMN IF NOT EXISTS started_at TIMESTAMP WITH TIME ZONE,
 ADD COLUMN IF NOT EXISTS duration_seconds INTEGER,
 ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE,
-ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE;
+ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE,
+ADD COLUMN IF NOT EXISTS interview_context_snapshot JSONB;
 
 -- 3. Add rich profile columns to candidate_profiles if not present
 ALTER TABLE public.candidate_profiles

@@ -99,6 +99,28 @@ export function InterviewRecordingViewer({
           .maybeSingle();
 
         if (recordingError) throw recordingError;
+
+        if (recordingData?.video_url) {
+          let playableUrl = recordingData.video_url;
+          if (!playableUrl.startsWith("blob:") && !playableUrl.startsWith("data:")) {
+            let storagePath = playableUrl;
+            if (storagePath.includes("/interview-recordings/")) {
+              storagePath = storagePath.split("/interview-recordings/").pop()?.split("?")[0] || storagePath;
+            }
+            try {
+              const { data: signedData } = await supabase.storage
+                .from("interview-recordings")
+                .createSignedUrl(storagePath, 7200);
+              if (signedData?.signedUrl) {
+                playableUrl = signedData.signedUrl;
+              }
+            } catch (sErr) {
+              console.warn("Could not create signed URL:", sErr);
+            }
+          }
+          recordingData.video_url = playableUrl;
+        }
+
         setRecording(recordingData);
         setHasViewed(!!recordingData?.viewed_at);
 
