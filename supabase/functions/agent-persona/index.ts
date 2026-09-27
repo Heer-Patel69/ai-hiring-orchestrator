@@ -4,6 +4,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -24,7 +25,6 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
@@ -56,7 +56,6 @@ serve(async (req) => {
     // Handle different actions
     if (action === "generate_questions") {
       const questions = await generateBehavioralQuestions(
-        lovableApiKey,
         job,
         candidate,
         roundConfig.num_questions
@@ -78,7 +77,6 @@ serve(async (req) => {
       const question = existingResponses?.[question_index]?.question;
       
       const evaluation = await evaluateResponse(
-        lovableApiKey,
         question,
         response_text,
         job,
@@ -102,7 +100,6 @@ serve(async (req) => {
 
     if (action === "generate_followup") {
       const followUp = await generateFollowUp(
-        lovableApiKey,
         response_text,
         job
       );
@@ -235,7 +232,6 @@ function formatScoreName(key: string): string {
 }
 
 async function generateBehavioralQuestions(
-  apiKey: string,
   job: any,
   candidate: any,
   numQuestions: number
@@ -270,33 +266,18 @@ Make questions appropriate for the experience level:
 
 Return a JSON array.`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         {
           role: "system",
           content: "You are an expert behavioral interviewer. Generate thoughtful, probing questions. Respond with valid JSON array.",
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.7,
-    }),
-  });
+      { temperature: 0.7 }
+    );
 
-  if (!response.ok) {
-    throw new Error(`AI API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
     const jsonMatch = content.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -314,7 +295,6 @@ Return a JSON array.`;
 }
 
 async function evaluateResponse(
-  apiKey: string,
   question: string,
   response: string,
   job: any,
@@ -354,33 +334,18 @@ Provide JSON:
   "areas_for_improvement": ["area 1", "area 2"]
 }`;
 
-  const apiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         {
           role: "system",
           content: "You are an expert behavioral interviewer. Evaluate responses fairly and constructively. Respond with valid JSON.",
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.3,
-    }),
-  });
+      { temperature: 0.3 }
+    );
 
-  if (!apiResponse.ok) {
-    throw new Error(`AI API error: ${apiResponse.status}`);
-  }
-
-  const data = await apiResponse.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -407,7 +372,7 @@ Provide JSON:
   };
 }
 
-async function generateFollowUp(apiKey: string, response: string, job: any) {
+async function generateFollowUp(response: string, job: any) {
   const prompt = `Based on this interview response, generate a natural follow-up question to dig deeper.
 
 RESPONSE: ${response}
@@ -419,26 +384,18 @@ Generate a conversational follow-up that:
 
 Respond with just the follow-up question, nothing else.`;
 
-  const apiResponse = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         { role: "system", content: "You are a conversational interviewer. Be warm but probing." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.7,
-    }),
-  });
+      { temperature: 0.7 }
+    );
 
-  if (!apiResponse.ok) {
-    throw new Error(`AI API error: ${apiResponse.status}`);
+    return content || "Can you tell me more about that?";
+  } catch (e) {
+    console.error("Failed to generate follow-up:", e);
+    return "Can you tell me more about that?";
   }
-
-  const data = await apiResponse.json();
-  return data.choices?.[0]?.message?.content || "Can you tell me more about that?";
 }

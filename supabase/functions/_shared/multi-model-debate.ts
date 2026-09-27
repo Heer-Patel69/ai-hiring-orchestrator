@@ -46,44 +46,35 @@ export interface DebateRound {
   resolution: string;
 }
 
+import { llmProvider } from "./llm-provider.ts";
+import { groqKeyManager } from "./groq-key-manager.ts";
+
+// Model configuration for AI debate
+export const DEBATE_MODELS = {
+  PRIMARY: "openai/gpt-oss-120b",
+  FAST: "openai/gpt-oss-120b",
+  REASONING: "openai/gpt-oss-120b",
+};
+
 // Call a single AI model for evaluation
 export async function callModel(
-  apiKey: string,
-  model: string,
+  _apiKey: string,
+  _model: string,
   systemPrompt: string,
   userPrompt: string,
   temperature: number = 0.3
 ): Promise<any> {
   try {
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature,
-      }),
+    const res = await llmProvider.chat({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature,
     });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        console.warn(`Rate limited on ${model}, waiting...`);
-        await new Promise(r => setTimeout(r, 2000));
-        return callModel(apiKey, model, systemPrompt, userPrompt, temperature);
-      }
-      throw new Error(`Model ${model} failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
+    return res.content;
   } catch (error) {
-    console.error(`Error calling ${model}:`, error);
+    console.error("[Debate] Error calling model via Groq:", error);
     return null;
   }
 }

@@ -6,20 +6,17 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Triple AI Model configuration for debate-based evaluation
+// Model configuration
 const AI_MODELS = {
-  // OpenAI GPT-5.2 - Enhanced reasoning for complex analysis
-  GPT_5_2: "openai/gpt-5.2",
-  // Gemini 3 Pro for comprehensive, deep analysis
-  GEMINI_PRO: "google/gemini-3-pro-preview",
-  // Gemini 3 Flash for real-time, quick feedback
-  GEMINI_FLASH: "google/gemini-3-flash-preview",
+  PRIMARY: "openai/gpt-oss-120b",
+  FAST: "openai/gpt-oss-120b",
 };
 
 interface CodeSubmission {
@@ -46,14 +43,12 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Handle real-time single code evaluation (uses Flash for speed)
+    // Handle real-time single code evaluation (uses Groq for speed)
     if (action === "evaluate_single" && submission) {
       const evaluation = await evaluateSingleCodeRealtime(
-        lovableApiKey,
         submission.code,
         submission.language,
         submission.problemStatement || "Solve the given problem"
@@ -63,13 +58,13 @@ serve(async (req) => {
         JSON.stringify({
           success: true,
           evaluation,
-          model_used: AI_MODELS.REALTIME,
+          model_used: llmProvider.model,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // Full evaluation for application (uses Pro for comprehensive analysis)
+    // Full evaluation for application
     if (!application_id) {
       throw new Error("application_id is required for full evaluation");
     }
@@ -107,9 +102,8 @@ serve(async (req) => {
       throw new Error("No code submissions found");
     }
 
-    console.log(`[Code Judge] Evaluating ${submissions.length} submissions for ${candidateName} using Triple AI Debate`);
+    console.log(`[Code Judge] Evaluating ${submissions.length} submissions for ${candidateName} using AI evaluation`);
 
-    // Analyze each submission with TRIPLE AI models in debate mode
     let totalScore = 0;
     let totalPasteEvents = 0;
     const languagesUsed = new Set<string>();
@@ -120,70 +114,19 @@ serve(async (req) => {
       languagesUsed.add(submission.language);
       totalPasteEvents += submission.paste_events || 0;
 
-      // Run TRIPLE AI analysis in parallel (debate mode)
-      const [gptAnalysis, proAnalysis, flashAnalysis] = await Promise.all([
-        // GPT-5.2 for enhanced reasoning
-        analyzeCodeWithAI(
-          lovableApiKey,
-          submission.code,
-          problem,
-          submission.language,
-          AI_MODELS.GPT_5_2,
-          "comprehensive"
-        ),
-        // Gemini Pro for deep analysis
-        analyzeCodeWithAI(
-          lovableApiKey,
-          submission.code,
-          problem,
-          submission.language,
-          AI_MODELS.GEMINI_PRO,
-          "comprehensive"
-        ),
-        // Gemini Flash for quick feedback
-        analyzeCodeWithAI(
-          lovableApiKey,
-          submission.code,
-          problem,
-          submission.language,
-          AI_MODELS.GEMINI_FLASH,
-          "quick"
-        ),
-      ]);
-
-      // Run debate to reach consensus if scores differ significantly
-      const scores = [
-        gptAnalysis?.score || 70,
-        proAnalysis?.score || 70,
-        flashAnalysis?.score || 70,
-      ];
-      const scoreRange = Math.max(...scores) - Math.min(...scores);
-      
-      let consensusAnalysis: any;
-      let debateOccurred = false;
-      
-      if (scoreRange > 15) {
-        // Significant disagreement - run debate round
-        debateOccurred = true;
-        console.log(`[Code Judge] Debate triggered: score range ${scoreRange} points`);
-        consensusAnalysis = await runDebateConsensus(
-          lovableApiKey,
-          gptAnalysis,
-          proAnalysis,
-          flashAnalysis,
-          submission.code,
-          problem
-        );
-      } else {
-        // Models agree - use weighted average
-        consensusAnalysis = mergeAnalyses(gptAnalysis, proAnalysis, flashAnalysis);
-      }
+      // Run comprehensive code analysis
+      const analysis = await analyzeCodeWithAI(
+        submission.code,
+        problem,
+        submission.language,
+        "comprehensive"
+      );
 
       // Calculate problem score with detailed breakdown
       const testScore = (submission.tests_passed / submission.tests_total) * 40;
-      const qualityScore = (consensusAnalysis.code_quality || 70) * 0.2;
-      const efficiencyScore = (consensusAnalysis.efficiency_score || 70) * 0.2;
-      const edgeCaseScore = (consensusAnalysis.edge_case_score || 60) * 0.1;
+      const qualityScore = (analysis.code_quality || 70) * 0.2;
+      const efficiencyScore = (analysis.efficiency_score || 70) * 0.2;
+      const edgeCaseScore = (analysis.edge_case_score || 60) * 0.1;
       const timeBonus = calculateTimeBonus(submission.execution_time_ms) * 0.1;
 
       const problemScore = testScore + qualityScore + efficiencyScore + edgeCaseScore + timeBonus;
@@ -195,37 +138,26 @@ serve(async (req) => {
         difficulty: problem.difficulty,
         tests_passed: submission.tests_passed,
         tests_total: submission.tests_total,
-        time_complexity: consensusAnalysis.detected_time_complexity,
-        space_complexity: consensusAnalysis.detected_space_complexity,
-        code_quality_score: consensusAnalysis.code_quality,
+        time_complexity: analysis.detected_time_complexity,
+        space_complexity: analysis.detected_space_complexity,
+        code_quality_score: analysis.code_quality,
         correctness_score: Math.round(testScore * 2.5),
         time_taken_minutes: Math.round((new Date(submission.submitted_at).getTime() - new Date(application.agent_started_at).getTime()) / 60000),
         language: submission.language,
         paste_events: submission.paste_events,
-        ai_review: consensusAnalysis,
-        models_used: AI_MODELS,
-        debate_occurred: debateOccurred,
-        individual_scores: {
-          gpt_5_2: gptAnalysis?.score || 0,
-          gemini_pro: proAnalysis?.score || 0,
-          gemini_flash: flashAnalysis?.score || 0,
-        },
-        // Detailed feedback for candidate
+        ai_review: analysis,
         feedback: {
-          gpt_feedback: gptAnalysis?.summary || "",
-          pro_feedback: proAnalysis?.summary || "",
-          flash_feedback: flashAnalysis?.summary || "",
-          consensus_summary: consensusAnalysis.summary,
-          strengths: consensusAnalysis.strengths,
-          issues: consensusAnalysis.issues,
-          suggestions: consensusAnalysis.suggestions,
-          error_analysis: consensusAnalysis.error_analysis || [],
-          optimization_tips: consensusAnalysis.optimization_tips || [],
+          consensus_summary: analysis.summary,
+          strengths: analysis.strengths,
+          issues: analysis.issues,
+          suggestions: analysis.suggestions,
+          error_analysis: analysis.error_analysis || [],
+          optimization_tips: analysis.optimization_tips || [],
           score_breakdown: {
             correctness: Math.round(testScore * 2.5),
-            code_quality: consensusAnalysis.code_quality,
-            efficiency: consensusAnalysis.efficiency_score,
-            edge_cases: consensusAnalysis.edge_case_score,
+            code_quality: analysis.code_quality,
+            efficiency: analysis.efficiency_score,
+            edge_cases: analysis.edge_case_score,
           }
         }
       });
@@ -234,10 +166,10 @@ serve(async (req) => {
       await supabase
         .from("code_submissions")
         .update({
-          ai_review: consensusAnalysis,
-          time_complexity: consensusAnalysis.detected_time_complexity,
-          space_complexity: consensusAnalysis.detected_space_complexity,
-          code_quality_score: consensusAnalysis.code_quality,
+          ai_review: analysis,
+          time_complexity: analysis.detected_time_complexity,
+          space_complexity: analysis.detected_space_complexity,
+          code_quality_score: analysis.code_quality,
         })
         .eq("id", submission.id);
     }
@@ -262,9 +194,8 @@ serve(async (req) => {
     // Make decision
     const decision: "pass" | "reject" = overallScore >= passingScore ? "pass" : "reject";
 
-    // Generate comprehensive reasoning with Pro model
+    // Generate comprehensive reasoning
     const reasoning = await generateDetailedReasoning(
-      lovableApiKey,
       decision,
       overallScore,
       passingScore,
@@ -351,7 +282,6 @@ function calculateTimeBonus(executionTimeMs: number): number {
 }
 
 async function generateDetailedReasoning(
-  apiKey: string,
   decision: string,
   overallScore: number,
   passingScore: number,
@@ -385,31 +315,19 @@ Create a structured markdown report with:
 5. Final Recommendation`;
 
   try {
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: AI_MODELS.COMPREHENSIVE,
-        messages: [
-          { role: "system", content: "You are a senior engineering manager writing performance evaluations. Be specific, fair, and constructive." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.3,
-      }),
-    });
+    const content = await llmProvider.chat(
+      [
+        { role: "system", content: "You are a senior engineering manager writing performance evaluations. Be specific, fair, and constructive." },
+        { role: "user", content: prompt },
+      ],
+      { temperature: 0.3 }
+    );
 
-    if (response.ok) {
-      const data = await response.json();
-      return data.choices?.[0]?.message?.content || generateFallbackReasoning(decision, overallScore, passingScore, problemScores);
-    }
+    return content || generateFallbackReasoning(decision, overallScore, passingScore, problemScores);
   } catch (e) {
     console.error("Failed to generate detailed reasoning:", e);
+    return generateFallbackReasoning(decision, overallScore, passingScore, problemScores);
   }
-
-  return generateFallbackReasoning(decision, overallScore, passingScore, problemScores);
 }
 
 function generateFallbackReasoning(
@@ -468,9 +386,8 @@ async function updateCandidateScore(
   }
 }
 
-// Real-time code evaluation using Flash model for speed
+// Real-time code evaluation
 async function evaluateSingleCodeRealtime(
-  apiKey: string,
   code: string,
   language: string,
   problemStatement: string
@@ -521,33 +438,18 @@ Analyze and provide JSON response:
   "quick_fix": "Most important thing to fix right now (1 sentence)"
 }`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: AI_MODELS.REALTIME,
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         {
           role: "system",
           content: "You are a senior software engineer reviewing code in real-time. Be concise, specific, and constructive. Focus on correctness first, then efficiency, then style. Respond with valid JSON only.",
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.2,
-    }),
-  });
+      { temperature: 0.2 }
+    );
 
-  if (!response.ok) {
-    throw new Error(`AI API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -564,14 +466,12 @@ Analyze and provide JSON response:
   };
 }
 
-// Comprehensive code analysis with configurable model
+// Comprehensive code analysis
 async function analyzeCodeWithAI(
-  apiKey: string,
   code: string,
   problem: any,
   language: string,
-  model: string,
-  analysisType: "quick" | "comprehensive"
+  analysisType: "quick" | "comprehensive" = "comprehensive"
 ) {
   const isComprehensive = analysisType === "comprehensive";
   
@@ -637,15 +537,9 @@ ${code}
 
 JSON response with: summary, code_quality (0-100), efficiency_score (0-100), edge_case_score (0-100), detected_time_complexity, detected_space_complexity, strengths (array), issues (array), suggestions (array)`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         {
           role: "system",
           content: isComprehensive 
@@ -654,18 +548,9 @@ JSON response with: summary, code_quality (0-100), efficiency_score (0-100), edg
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.2,
-    }),
-  });
+      { temperature: 0.2 }
+    );
 
-  if (!response.ok) {
-    throw new Error(`AI API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -690,135 +575,4 @@ JSON response with: summary, code_quality (0-100), efficiency_score (0-100), edg
     suggestions: ["Review edge cases", "Consider optimization"],
     interview_notes: "Analysis incomplete",
   };
-}
-
-// Merge analyses from three models with weighted average
-function mergeAnalyses(gpt: any, pro: any, flash: any): any {
-  // Weights: GPT-5.2 (40%), Gemini Pro (35%), Gemini Flash (25%)
-  const weights = { gpt: 0.40, pro: 0.35, flash: 0.25 };
-  
-  const weightedAvg = (field: string) => {
-    const gptVal = gpt?.[field] ?? 70;
-    const proVal = pro?.[field] ?? 70;
-    const flashVal = flash?.[field] ?? 70;
-    return Math.round(gptVal * weights.gpt + proVal * weights.pro + flashVal * weights.flash);
-  };
-
-  return {
-    summary: gpt?.summary || pro?.summary || flash?.summary || "Code analysis complete.",
-    score: weightedAvg("score"),
-    code_quality: weightedAvg("code_quality"),
-    efficiency_score: weightedAvg("efficiency_score"),
-    edge_case_score: weightedAvg("edge_case_score"),
-    detected_time_complexity: pro?.detected_time_complexity || gpt?.detected_time_complexity || flash?.detected_time_complexity || "Unknown",
-    detected_space_complexity: pro?.detected_space_complexity || gpt?.detected_space_complexity || flash?.detected_space_complexity || "Unknown",
-    is_optimal: gpt?.is_optimal ?? pro?.is_optimal ?? false,
-    readability: weightedAvg("readability"),
-    best_practices: weightedAvg("best_practices"),
-    correctness_analysis: gpt?.correctness_analysis || pro?.correctness_analysis || {},
-    error_analysis: [...(gpt?.error_analysis || []), ...(pro?.error_analysis || [])].slice(0, 5),
-    optimization_tips: [...(gpt?.optimization_tips || []), ...(pro?.optimization_tips || [])].slice(0, 3),
-    strengths: [...new Set([...(gpt?.strengths || []), ...(pro?.strengths || []), ...(flash?.strengths || [])])].slice(0, 5),
-    issues: [...new Set([...(gpt?.issues || []), ...(pro?.issues || []), ...(flash?.issues || [])])].slice(0, 5),
-    suggestions: [...new Set([...(gpt?.suggestions || []), ...(pro?.suggestions || []), ...(flash?.suggestions || [])])].slice(0, 5),
-    interview_notes: gpt?.interview_notes || pro?.interview_notes || "",
-    triple_model_analysis: true,
-    models_agreed: true,
-  };
-}
-
-// Run debate consensus when models significantly disagree
-async function runDebateConsensus(
-  apiKey: string,
-  gpt: any,
-  pro: any,
-  flash: any,
-  code: string,
-  problem: any
-): Promise<any> {
-  const debatePrompt = `You are mediating a code evaluation debate between three AI models.
-
-PROBLEM: ${problem.title}
-
-CODE BEING REVIEWED:
-\`\`\`
-${code.slice(0, 1500)}
-\`\`\`
-
-MODEL EVALUATIONS:
-1. GPT-5.2: Score ${gpt?.score || "N/A"} - "${gpt?.summary || "No summary"}"
-   Strengths: ${(gpt?.strengths || []).join(", ")}
-   Issues: ${(gpt?.issues || []).join(", ")}
-
-2. Gemini Pro: Score ${pro?.score || "N/A"} - "${pro?.summary || "No summary"}"
-   Strengths: ${(pro?.strengths || []).join(", ")}
-   Issues: ${(pro?.issues || []).join(", ")}
-
-3. Gemini Flash: Score ${flash?.score || "N/A"} - "${flash?.summary || "No summary"}"
-   Strengths: ${(flash?.strengths || []).join(", ")}
-   Issues: ${(flash?.issues || []).join(", ")}
-
-Analyze the disagreement and provide a CONSENSUS evaluation. Consider:
-1. Which model's assessment is most accurate based on the actual code?
-2. What are the valid points each model raises?
-3. What is a fair consensus score?
-
-Respond with JSON:
-{
-  "consensus_score": 0-100,
-  "consensus_reasoning": "Why this score was chosen after debate",
-  "summary": "Final 2-3 sentence assessment",
-  "code_quality": 0-100,
-  "efficiency_score": 0-100,
-  "edge_case_score": 0-100,
-  "detected_time_complexity": "O(?)",
-  "detected_space_complexity": "O(?)",
-  "strengths": ["agreed strengths from all models"],
-  "issues": ["issues that at least 2 models flagged"],
-  "suggestions": ["actionable improvements"],
-  "debate_resolution": "How the disagreement was resolved"
-}`;
-
-  try {
-    // Use GPT-5.2 as the mediator (best reasoning)
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: AI_MODELS.GPT_5_2,
-        messages: [
-          {
-            role: "system",
-            content: "You are an impartial judge resolving disagreements between AI code reviewers. Your goal is to find the most accurate and fair assessment. Respond with valid JSON only.",
-          },
-          { role: "user", content: debatePrompt },
-        ],
-        temperature: 0.3,
-      }),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content || "";
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const result = JSON.parse(jsonMatch[0]);
-        return {
-          ...result,
-          score: result.consensus_score,
-          triple_model_analysis: true,
-          debate_occurred: true,
-          models_agreed: false,
-        };
-      }
-    }
-  } catch (e) {
-    console.error("Debate consensus failed:", e);
-  }
-
-  // Fallback: use weighted average
-  return mergeAnalyses(gpt, pro, flash);
 }

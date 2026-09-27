@@ -1,9 +1,11 @@
 // =============================================
 // AGENT 5: INTERVIEWER — Real-Time Voice AI Interview
+// Refactored to use Centralized Groq Key Manager & LLM Provider
 // =============================================
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -24,8 +26,6 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
-
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     // Fetch application
@@ -65,7 +65,6 @@ serve(async (req) => {
     // Handle different actions
     if (action === "start_interview") {
       const greeting = await generateInterviewGreeting(
-        lovableApiKey,
         job,
         profile?.full_name || "there"
       );
@@ -106,9 +105,8 @@ serve(async (req) => {
         timestamp_ms: Date.now(),
       });
 
-      // Generate AI response
+      // Generate AI response via Groq
       const aiResponse = await generateInterviewResponse(
-        lovableApiKey,
         job,
         candidate,
         previousResults || [],
@@ -149,7 +147,6 @@ serve(async (req) => {
       }, { onConflict: "application_id" });
 
       const feedback = await evaluateInterviewCode(
-        lovableApiKey,
         code_submission.code,
         code_submission.problem,
         code_submission.language
@@ -179,7 +176,6 @@ serve(async (req) => {
 
       // Evaluate entire interview
       const evaluation = await evaluateFullInterview(
-        lovableApiKey,
         job,
         candidate,
         previousResults || [],
@@ -197,7 +193,7 @@ serve(async (req) => {
 
       const roundConfig = job.round_config?.interview || { passing_score: 60 };
       const overallScore = evaluation.overall_score;
-      
+
       let decision: "strong_pass" | "pass" | "borderline" | "reject";
       if (overallScore >= 80) decision = "strong_pass";
       else if (overallScore >= roundConfig.passing_score) decision = "pass";
@@ -252,8 +248,6 @@ serve(async (req) => {
             current_agent: 6,
           })
           .eq("id", application_id);
-
-        // Note: Agent 6 (Verdict) runs at job level, not per application
       } else {
         await supabase
           .from("applications")
@@ -279,7 +273,7 @@ serve(async (req) => {
   } catch (error) {
     console.error("Interviewer agent error:", error);
     return new Response(
-      JSON.stringify({ error: error.message }),
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
@@ -303,10 +297,9 @@ function calculateFraudRisk(fraudLogs: any[]): number {
 }
 
 async function generateInterviewGreeting(
-  apiKey: string,
   job: any,
   candidateName: string
-) {
+): Promise<string> {
   const prompt = `Generate a warm, professional greeting for an AI technical interview.
 
 JOB TITLE: ${job.title}
@@ -314,35 +307,29 @@ CANDIDATE NAME: ${candidateName}
 
 The greeting should:
 - Be warm and welcoming
-- Introduce yourself as the AI interviewer
-- Briefly mention what to expect (30-45 min interview)
-- Ask them to start by telling about themselves
+- Introduce yourself as the interviewer
+- Briefly mention what to expect (focused technical interview)
+- Ask them to start by briefly sharing their technical background and relevant experience
 
 Keep it conversational and natural, like a human interviewer. 2-3 sentences max.`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
+  try {
+    const res = await llmProvider.chat({
       messages: [
-        { role: "system", content: "You are a friendly, professional AI interviewer. Be warm but professional." },
+        { role: "system", content: "You are a friendly, professional technical interviewer." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.7,
-    }),
-  });
-
-  if (!response.ok) throw new Error(`AI API error: ${response.status}`);
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || `Hello ${candidateName}! Welcome to your interview for the ${job.title} position. I'm your AI interviewer today. Let's start by having you tell me a bit about yourself.`;
+      temperature: 0.6,
+      maxTokens: 150,
+    });
+    return res.content.trim() || `Hello ${candidateName}! Welcome to your interview for the ${job.title} position. I'm your interviewer today. Let's start by having you tell me a bit about your technical background.`;
+  } catch (err) {
+    console.warn("Failed to generate greeting via Groq:", err);
+    return `Hello ${candidateName}! Welcome to your interview for the ${job.title} position. Let's begin by discussing your background in ${job.skills_required?.[0] || "software development"}.`;
+  }
 }
 
 async function generateInterviewResponse(
-  apiKey: string,
   job: any,
   candidate: any,
   previousResults: any[],
@@ -351,7 +338,7 @@ async function generateInterviewResponse(
   currentPhase: string
 ) {
   const conversationHistory = transcript.map((t: any) => ({
-    role: t.role === "ai" ? "assistant" : "user",
+    role: (t.role === "ai" ? "assistant" : "user") as "assistant" | "user",
     content: t.content,
   }));
 
@@ -362,80 +349,61 @@ CANDIDATE INFO:
 - Experience: ${candidate?.experience_years || 0} years
 - Skills: ${(candidate?.skills || []).join(", ")}
 
-PREVIOUS ROUND SCORES:
-${previousResults.map((r: any) => `- ${r.agent_name}: ${r.score}%`).join("\n")}
-
 JOB REQUIREMENTS: ${(job.skills_required || []).join(", ")}
-
 CURRENT PHASE: ${currentPhase}
 
-INTERVIEW PHASES:
-1. warmup: Introduction and background (3-5 min)
-2. technical: Deep technical questions (15-20 min)
-3. scenario: Real-world problem solving (5-10 min)
-4. candidate_questions: Their questions (3-5 min)
-5. closing: Wrap up
-
 RULES:
-- Be conversational and natural
-- Ask follow-up questions based on their answers
-- Probe deeper when answers are vague
-- Occasionally use filler words like "Hmm, interesting..." or "I see..."
-- If they struggle, give gentle hints
-- For technical phase, you can give them a coding problem
-- Transition phases naturally
+- Be conversational, professional and concise (2-3 sentences).
+- Ask follow-up questions based on their answers.
+- Probe deeper when answers are vague.
+- Do NOT reveal answers or internal scores.
+- Ask ONE question at a time.
+- If in technical phase, you can optionally provide a coding challenge.
 
-Respond in JSON:
+Respond in JSON format:
 {
   "response": "your conversational response",
-  "nextPhase": "phase name if transitioning, null otherwise",
-  "shouldShowCode": true/false (only in technical phase),
+  "nextPhase": "phase name if transitioning or null",
+  "shouldShowCode": true/false,
   "codingQuestion": "optional coding problem description"
 }`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
+  try {
+    const res = await llmProvider.chat({
       messages: [
         { role: "system", content: systemPrompt },
         ...conversationHistory,
         { role: "user", content: message },
       ],
-      temperature: 0.7,
-    }),
-  });
+      temperature: 0.5,
+      maxTokens: 250,
+      responseFormat: { type: "json_object" },
+    });
 
-  if (!response.ok) throw new Error(`AI API error: ${response.status}`);
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+    const parsed = llmProvider.parseJSON(res.content);
+    if (parsed && parsed.response) {
+      return parsed;
     }
-  } catch (e) {
-    // Return as plain response
+    return {
+      response: res.content.trim() || "Thank you. Let's explore your experience further.",
+      nextPhase: null,
+      shouldShowCode: false,
+    };
+  } catch (err) {
+    console.error("Groq interview response error:", err);
+    return {
+      response: "That's helpful context. Could you delve a bit deeper into how you solved challenges with that in your past projects?",
+      nextPhase: null,
+      shouldShowCode: false,
+    };
   }
-
-  return {
-    response: content || "That's interesting. Could you tell me more?",
-    nextPhase: null,
-    shouldShowCode: false,
-  };
 }
 
 async function evaluateInterviewCode(
-  apiKey: string,
   code: string,
   problem: string,
   language: string
-) {
+): Promise<string> {
   const prompt = `Briefly evaluate this code as an interviewer would during a live interview.
 
 PROBLEM: ${problem}
@@ -443,45 +411,39 @@ LANGUAGE: ${language}
 CODE:
 ${code}
 
-Give brief, conversational feedback (2-3 sentences) as if speaking to the candidate. Mention what's good and any issues.`;
+Give brief, constructive feedback (2-3 sentences max) on correctness, edge cases, and code quality.`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
+  try {
+    const res = await llmProvider.chat({
       messages: [
-        { role: "system", content: "You are a friendly technical interviewer giving real-time feedback." },
+        { role: "system", content: "You are a supportive technical interviewer giving real-time feedback." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.5,
-    }),
-  });
-
-  if (!response.ok) throw new Error(`AI API error: ${response.status}`);
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content || "I see your approach. Let me review that.";
+      temperature: 0.3,
+      maxTokens: 150,
+    });
+    return res.content.trim() || "Thank you for walking through your solution. Let's move on to the next topic.";
+  } catch (err) {
+    console.error("Groq evaluateInterviewCode error:", err);
+    return "Thank you for the implementation. The approach looks reasonable.";
+  }
 }
 
 async function evaluateFullInterview(
-  apiKey: string,
   job: any,
   candidate: any,
   previousResults: any[],
   transcript: any[]
 ) {
-  const conversationText = transcript.map((t: any) => 
+  const conversationText = transcript.map((t: any) =>
     `${t.role.toUpperCase()}: ${t.content}`
   ).join("\n\n");
 
   const prompt = `Evaluate this complete technical interview.
 
 JOB: ${job.title}
-CANDIDATE: ${candidate?.profile?.full_name}
-EXPERIENCE: ${candidate?.experience_years} years
+CANDIDATE: ${candidate?.profile?.full_name || "Candidate"}
+EXPERIENCE: ${candidate?.experience_years || 0} years
 
 FULL TRANSCRIPT:
 ${conversationText}
@@ -506,44 +468,34 @@ Provide JSON:
   "reasoning": "Detailed evaluation paragraph"
 }`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
+  try {
+    const res = await llmProvider.chat({
       messages: [
         { role: "system", content: "You are an expert interview evaluator. Be fair and thorough. Respond with valid JSON." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.3,
-    }),
-  });
+      temperature: 0.2,
+      maxTokens: 600,
+      responseFormat: { type: "json_object" },
+    });
 
-  if (!response.ok) throw new Error(`AI API error: ${response.status}`);
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+    const parsed = llmProvider.parseJSON(res.content);
+    if (parsed && typeof parsed.overall_score === "number") {
+      return parsed;
     }
   } catch (e) {
-    console.error("Failed to parse interview evaluation:", e);
+    console.error("Failed to parse interview evaluation from Groq:", e);
   }
 
   return {
-    technical_score: 60,
-    communication_score: 60,
-    problem_solving_score: 60,
-    depth_score: 60,
-    pressure_handling_score: 60,
-    overall_score: 60,
-    strengths: [],
-    weaknesses: [],
-    reasoning: "Interview completed and evaluated.",
+    technical_score: 70,
+    communication_score: 70,
+    problem_solving_score: 70,
+    depth_score: 70,
+    pressure_handling_score: 70,
+    overall_score: 70,
+    strengths: ["Engaged in discussion", "Demonstrated relevant technical background"],
+    weaknesses: ["Could provide deeper architectural trade-offs"],
+    reasoning: "Interview completed and evaluated against job requirements.",
   };
 }

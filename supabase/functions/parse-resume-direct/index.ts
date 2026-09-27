@@ -1,11 +1,33 @@
+import { llmProvider } from "../_shared/llm-provider.ts";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-interface FieldWithConfidence<T> {
-  value: T;
-  confidence: "high" | "medium" | "low";
+interface Education {
+  degree: string;
+  institution: string;
+  year: number;
+  field?: string;
+  gpa?: string;
+}
+
+interface WorkExperience {
+  company: string;
+  title: string;
+  duration: string;
+  startDate?: string;
+  endDate?: string;
+  description: string;
+  technologies?: string[];
+}
+
+interface Project {
+  name: string;
+  description: string;
+  technologies: string[];
+  url?: string;
 }
 
 interface ResumeData {
@@ -41,29 +63,40 @@ interface ResumeData {
   };
 }
 
-interface Education {
-  degree: string;
-  institution: string;
-  year: number;
-  field?: string;
-  gpa?: string;
-}
+function extractTextFromPdfBase64(base64: string): string {
+  try {
+    const binary = atob(base64.replace(/\s/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
 
-interface WorkExperience {
-  company: string;
-  title: string;
-  duration: string;
-  startDate?: string;
-  endDate?: string;
-  description: string;
-  technologies?: string[];
-}
+    // Extract visible text from uncompressed PDF streams or ASCII strings
+    let rawText = "";
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    const fullString = decoder.decode(bytes);
 
-interface Project {
-  name: string;
-  description: string;
-  technologies: string[];
-  url?: string;
+    // 1. Look for text in PDF literal strings: (text) Tj or [(text)] TJ
+    const tjMatches = fullString.match(/\(([^)]+)\)\s*(?:Tj|'|")/g);
+    if (tjMatches && tjMatches.length > 5) {
+      rawText = tjMatches.map((m) => m.replace(/^\(/, "").replace(/\)\s*(?:Tj|'|")$/, "")).join(" ");
+    }
+
+    // 2. If literal string extraction yielded very little, scan for printable ascii sequences
+    if (rawText.length < 100) {
+      const printableMatches = fullString.match(/[A-Za-z0-9@._:\-\+\#\s\/\(\)]{4,}/g);
+      if (printableMatches) {
+        rawText = printableMatches
+          .filter((s) => !/^(obj|endobj|stream|endstream|xref|trailer|startxref)/.test(s.trim()))
+          .join(" ");
+      }
+    }
+
+    return rawText.slice(0, 15000); // Keep within reasonable context window
+  } catch (err) {
+    console.warn("Failed to extract text from PDF directly:", err);
+    return "";
+  }
 }
 
 Deno.serve(async (req) => {
@@ -81,7 +114,6 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Check file size (base64 is ~4/3 larger than binary)
     const estimatedSizeBytes = (base64Content.length * 3) / 4;
     const maxSizeMB = 10;
     if (estimatedSizeBytes > maxSizeMB * 1024 * 1024) {
@@ -91,275 +123,123 @@ Deno.serve(async (req) => {
       );
     }
 
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY");
-    
-    if (!lovableApiKey) {
-      return new Response(
-        JSON.stringify({ error: "AI service not configured" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
+    const extractedText = extractTextFromPdfBase64(base64Content);
+    const resumeData = await extractResumeWithGroq(extractedText);
 
-    // Use AI to extract information from resume with enhanced prompting
-    const extractedData = await extractResumeData(base64Content, lovableApiKey);
-
-    if (!extractedData) {
+    if (!resumeData) {
       return new Response(
-        JSON.stringify({ error: "Failed to parse resume. Please ensure the PDF is readable and not password-protected." }),
+        JSON.stringify({ error: "Failed to parse resume text. Please ensure the document contains readable text." }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // Validate extracted data
-    const validationWarnings = validateExtractedData(extractedData);
-    extractedData.validation_warnings = validationWarnings;
+    const validationWarnings: string[] = [];
+    if (!resumeData.fullName) validationWarnings.push("Full name could not be identified.");
+    if (!resumeData.email) validationWarnings.push("Email address was not found.");
+    if (resumeData.skills.length === 0) validationWarnings.push("No technical skills were detected.");
 
-    console.log("Resume parsed successfully:", {
-      skills_count: extractedData.skills?.length || 0,
-      education_count: extractedData.education?.length || 0,
-      projects_count: extractedData.projects?.length || 0,
-      experience_count: extractedData.workExperience?.length || 0,
-      warnings_count: validationWarnings.length,
-    });
+    resumeData.validation_warnings = validationWarnings;
 
     return new Response(
-      JSON.stringify({ success: true, data: extractedData }),
+      JSON.stringify({ success: true, data: resumeData }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("Resume parsing error:", error);
     return new Response(
-      JSON.stringify({ error: error.message || "An unexpected error occurred while parsing the resume." }),
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown parsing error" }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 });
 
-function validateExtractedData(data: ResumeData): string[] {
-  const warnings: string[] = [];
+async function extractResumeWithGroq(rawText: string): Promise<ResumeData | null> {
+  const prompt = `Analyze this extracted resume content and return a structured JSON profile.
 
-  // Validate email format
-  if (data.email && !isValidEmail(data.email)) {
-    warnings.push("Email format appears invalid");
-  }
+RESUME CONTENT:
+"""
+${rawText || "No readable text extracted. Provide empty profile."}
+"""
 
-  // Validate phone format
-  if (data.phone && !isValidPhone(data.phone)) {
-    warnings.push("Phone number format may be incorrect");
-  }
-
-  // Check for missing critical fields
-  if (!data.fullName) {
-    warnings.push("Full name could not be extracted");
-  }
-
-  if (!data.email) {
-    warnings.push("Email address could not be extracted");
-  }
-
-  if (data.skills.length === 0) {
-    warnings.push("No skills were detected in the resume");
-  }
-
-  if (data.education.length === 0) {
-    warnings.push("No education history was detected");
-  }
-
-  if (data.workExperience.length === 0 && data.experience_years > 0) {
-    warnings.push("Experience years detected but no work history details found");
-  }
-
-  // Check for date consistency in work experience
-  // (simplified check - just flag if something seems off)
-  if (data.experience_years > 30) {
-    warnings.push("Experience years seems unusually high - please verify");
-  }
-
-  return warnings;
-}
-
-function isValidEmail(email: string): boolean {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
-
-function isValidPhone(phone: string): boolean {
-  // Allow various phone formats - just check for reasonable length and digits
-  const digitsOnly = phone.replace(/\D/g, '');
-  return digitsOnly.length >= 7 && digitsOnly.length <= 15;
-}
-
-async function extractResumeData(base64Pdf: string, apiKey: string): Promise<ResumeData | null> {
-  try {
-    const prompt = `You are an expert resume parser with OCR capabilities. Analyze the provided PDF resume document carefully. If the document is a scanned image, use OCR to read the text.
-
-Extract ALL information and return it in this exact JSON structure:
-
+Extract and populate this exact JSON structure:
 {
-  "fullName": "Full name of the candidate (string or null)",
-  "email": "Email address (string or null)",
-  "phone": "Phone number with country code if available (string or null)",
-  "location": "City, State/Country (string or null)",
-  "skills": ["Comprehensive array of ALL skills - include programming languages, frameworks, libraries, tools, databases, cloud platforms, soft skills, methodologies, etc."],
-  "experience_years": <total years of professional experience as a number>,
+  "fullName": string or null,
+  "email": string or null,
+  "phone": string or null,
+  "location": string or null,
+  "skills": ["Array", "of", "technical", "skills", "and", "tools"],
+  "experience_years": number (e.g. 3),
   "education": [
     {
-      "degree": "Degree name (e.g., Bachelor of Science, MBA)",
-      "institution": "University/College name",
-      "year": <graduation year as number>,
-      "field": "Field of study (e.g., Computer Science)",
-      "gpa": "GPA if mentioned (string or null)"
+      "degree": "B.Tech Computer Science",
+      "institution": "University Name",
+      "year": 2024,
+      "field": "Computer Science"
     }
   ],
   "workExperience": [
     {
-      "company": "Company name",
-      "title": "Job title",
-      "duration": "Duration string (e.g., 'Jan 2020 - Dec 2022')",
-      "startDate": "Start date if clear (e.g., '2020-01')",
-      "endDate": "End date or 'Present' (e.g., '2022-12')",
-      "description": "Brief description of role and responsibilities",
-      "technologies": ["Technologies used in this role"]
+      "company": "Company Name",
+      "title": "Software Engineer",
+      "duration": "2 years",
+      "description": "Built backend APIs...",
+      "technologies": ["Node.js", "PostgreSQL"]
     }
   ],
   "projects": [
     {
-      "name": "Project name",
-      "description": "Brief description",
-      "technologies": ["Technologies used"],
-      "url": "Project URL if available (string or null)"
+      "name": "Project Name",
+      "description": "Description of project",
+      "technologies": ["React", "TypeScript"]
     }
   ],
-  "certifications": ["List of professional certifications"],
-  "languages": ["Languages spoken (e.g., English, Spanish)"],
-  "summary": "Professional summary or objective statement (string or null)",
-  "github_url": "GitHub profile URL if found (string or null)",
-  "linkedin_url": "LinkedIn profile URL if found (string or null)",
-  "portfolio_url": "Portfolio/personal website URL if found (string or null)",
+  "certifications": ["AWS Certified Solutions Architect"],
+  "languages": ["English"],
+  "summary": "Professional summary...",
+  "github_url": string or null,
+  "linkedin_url": string or null,
+  "portfolio_url": string or null,
   "confidence_scores": {
-    "fullName": "<high/medium/low based on clarity of extraction>",
-    "email": "<high/medium/low>",
-    "phone": "<high/medium/low>",
-    "skills": "<high/medium/low based on how clearly skills were listed>",
-    "experience": "<high/medium/low based on clarity of work history>",
-    "education": "<high/medium/low>"
+    "fullName": "high",
+    "email": "high",
+    "phone": "high",
+    "skills": "high",
+    "experience": "high",
+    "education": "high"
   },
   "suggested_job_preferences": {
-    "fields": ["Suggested job fields based on experience, e.g., 'Frontend Development', 'Data Science'"],
-    "experience_level": "<entry/junior/mid/senior/lead/principal based on years and roles>",
-    "roles": ["Suggested job titles the candidate would be suitable for"],
-    "work_type": ["remote", "hybrid", "onsite - based on any preferences mentioned or infer from experience"]
+    "fields": ["Full Stack", "Backend"],
+    "experience_level": "junior",
+    "roles": ["Full Stack Developer", "Backend Engineer"],
+    "work_type": ["remote", "hybrid"]
   }
 }
 
-CRITICAL INSTRUCTIONS:
-1. Be THOROUGH - extract every skill, technology, and tool mentioned anywhere in the resume
-2. For scanned/image PDFs, perform OCR to read the text
-3. If a field is unclear or not found, set it to null or empty array
-4. Confidence scores should reflect how clearly the information was presented
-5. Experience level: entry=0-1 years, junior=1-3, mid=3-5, senior=5-10, lead/principal=10+
-6. Return ONLY valid JSON - no markdown, no explanations, no code blocks`;
+Return ONLY valid JSON.`;
 
-    // Use Lovable AI Gateway with the correct endpoint
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              {
-                type: "image_url",
-                image_url: {
-                  url: `data:application/pdf;base64,${base64Pdf}`,
-                },
-              },
-            ],
-          },
-        ],
-      }),
+  try {
+    const res = await llmProvider.chat({
+      messages: [
+        { role: "system", content: "You are an expert resume parser that outputs strictly valid JSON." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.1,
+      maxTokens: 3000,
+      responseFormat: { type: "json_object" },
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("AI API error:", response.status, errorText);
-      
-      if (response.status === 429) {
-        throw new Error("Service is busy. Please try again in a few seconds.");
-      }
-      if (response.status === 402) {
-        throw new Error("Service temporarily unavailable. Please try again later.");
-      }
-      
-      return null;
+    const parsed = llmProvider.parseJSON<ResumeData>(res.content);
+    if (parsed) {
+      if (!Array.isArray(parsed.skills)) parsed.skills = [];
+      if (!Array.isArray(parsed.education)) parsed.education = [];
+      if (!Array.isArray(parsed.workExperience)) parsed.workExperience = [];
+      if (!Array.isArray(parsed.projects)) parsed.projects = [];
+      if (typeof parsed.experience_years !== "number") parsed.experience_years = 0;
+      return parsed;
     }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-
-    if (content) {
-      try {
-        // Clean the content - remove any markdown code blocks if present
-        let cleanContent = content.trim();
-        if (cleanContent.startsWith("```json")) {
-          cleanContent = cleanContent.slice(7);
-        } else if (cleanContent.startsWith("```")) {
-          cleanContent = cleanContent.slice(3);
-        }
-        if (cleanContent.endsWith("```")) {
-          cleanContent = cleanContent.slice(0, -3);
-        }
-        cleanContent = cleanContent.trim();
-
-        const parsed = JSON.parse(cleanContent);
-        
-        return {
-          fullName: parsed.fullName || null,
-          email: parsed.email || null,
-          phone: parsed.phone || null,
-          location: parsed.location || null,
-          skills: Array.isArray(parsed.skills) ? parsed.skills : [],
-          experience_years: typeof parsed.experience_years === "number" ? parsed.experience_years : 0,
-          education: Array.isArray(parsed.education) ? parsed.education : [],
-          workExperience: Array.isArray(parsed.workExperience) ? parsed.workExperience : [],
-          projects: Array.isArray(parsed.projects) ? parsed.projects : [],
-          certifications: Array.isArray(parsed.certifications) ? parsed.certifications : [],
-          languages: Array.isArray(parsed.languages) ? parsed.languages : [],
-          summary: parsed.summary || null,
-          github_url: parsed.github_url || null,
-          linkedin_url: parsed.linkedin_url || null,
-          portfolio_url: parsed.portfolio_url || null,
-          confidence_scores: parsed.confidence_scores || {
-            fullName: "medium",
-            email: "medium",
-            phone: "medium",
-            skills: "medium",
-            experience: "medium",
-            education: "medium",
-          },
-          validation_warnings: [],
-          suggested_job_preferences: parsed.suggested_job_preferences || {
-            fields: [],
-            experience_level: "mid",
-            roles: [],
-            work_type: ["remote", "hybrid", "onsite"],
-          },
-        };
-      } catch (parseError) {
-        console.error("JSON parse error:", parseError, content);
-        return null;
-      }
-    }
-
     return null;
-  } catch (error) {
-    console.error("Resume extraction error:", error);
-    throw error;
+  } catch (err) {
+    console.error("Groq extractResumeWithGroq error:", err);
+    return null;
   }
 }

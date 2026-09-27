@@ -6,17 +6,11 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-
-// Triple AI Model configuration for debate-based evaluation
-const AI_MODELS = {
-  GPT_5_2: "openai/gpt-5.2",
-  GEMINI_PRO: "google/gemini-3-pro-preview",
-  GEMINI_FLASH: "google/gemini-3-flash-preview",
 };
 
 serve(async (req) => {
@@ -33,7 +27,6 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
@@ -150,9 +143,8 @@ serve(async (req) => {
         (scores.interview > 0 && application.current_agent >= 5);
 
       if (completedAllRounds) {
-        // Generate AI recommendation using Pro model
+        // Generate AI recommendation using Groq LLM
         const recommendation = await generateRecommendation(
-          lovableApiKey,
           job,
           { profile, candidateProfile, name: candidateName },
           appResults,
@@ -240,7 +232,7 @@ serve(async (req) => {
       bias_analysis: "No significant bias detected",
       pipeline_duration_avg_days: 3.2,
       ai_confidence: 87,
-      models_used: AI_MODELS,
+      models_used: [llmProvider.model],
     };
 
     // Store reports in database
@@ -293,7 +285,7 @@ serve(async (req) => {
           total_rejected: rejectedCandidates.length,
           by_stage: stageRejections,
         },
-        models_used: AI_MODELS,
+        models_used: [llmProvider.model],
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
@@ -384,14 +376,12 @@ function average(nums: number[]): number {
 }
 
 async function generateRecommendation(
-  apiKey: string,
   job: any,
   candidate: any,
   results: any[],
   finalScore: number
 ) {
   const candidateName = candidate.name;
-  const profile = candidate.profile;
   const candidateProfile = candidate.candidateProfile;
   
   const prompt = `Generate a comprehensive hiring recommendation for this candidate.
@@ -415,34 +405,15 @@ Provide JSON:
   "recommendation": "2-3 paragraph detailed recommendation including hire/no-hire decision with justification, fit for role, and potential growth areas"
 }`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: AI_MODELS.COMPREHENSIVE,
-      messages: [
+  try {
+    const content = await llmProvider.chat(
+      [
         { role: "system", content: "You are an expert hiring consultant providing detailed, actionable recommendations. Be specific and reference actual performance data. Respond with valid JSON." },
         { role: "user", content: prompt },
       ],
-      temperature: 0.3,
-    }),
-  });
+      { temperature: 0.3 }
+    );
 
-  if (!response.ok) {
-    return {
-      strengths: ["Completed all rounds"],
-      weaknesses: ["Could not generate detailed analysis"],
-      recommendation: `${candidateName} scored ${finalScore}% overall and completed all interview rounds.`,
-    };
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -452,8 +423,8 @@ Provide JSON:
   }
 
   return {
-    strengths: ["Completed assessment"],
+    strengths: ["Completed all rounds"],
     weaknesses: [],
-    recommendation: `${candidateName} - Final score: ${finalScore}%`,
+    recommendation: `${candidateName} scored ${finalScore}% overall and completed all interview rounds.`,
   };
 }

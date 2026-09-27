@@ -6,17 +6,17 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// Triple AI Model configuration for debate-based evaluation
+// Model configuration
 const AI_MODELS = {
-  GPT_5_2: "openai/gpt-5.2",
-  GEMINI_PRO: "google/gemini-3-pro-preview",
-  GEMINI_FLASH: "google/gemini-3-flash-preview",
+  PRIMARY: "openai/gpt-oss-120b",
+  FAST: "openai/gpt-oss-120b",
 };
 
 serve(async (req) => {
@@ -33,7 +33,6 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
@@ -154,9 +153,8 @@ serve(async (req) => {
       });
     }
 
-    // Generate AI-powered detailed analysis using DUAL models
+    // Generate AI-powered detailed analysis using Groq
     const aiAnalysis = await generateMCQAnalysis(
-      lovableApiKey,
       candidateName,
       job,
       normalizedScore,
@@ -249,7 +247,6 @@ serve(async (req) => {
 });
 
 async function generateMCQAnalysis(
-  apiKey: string,
   candidateName: string,
   job: any,
   score: number,
@@ -290,35 +287,22 @@ Provide JSON analysis:
 }`;
 
   try {
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: AI_MODELS.COMPREHENSIVE,
-        messages: [
-          { 
-            role: "system", 
-            content: "You are an expert technical assessor analyzing MCQ performance. Provide specific, actionable insights. Respond with valid JSON only." 
-          },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.3,
-      }),
+    const res = await llmProvider.chat({
+      messages: [
+        {
+          role: "system",
+          content: "You are an expert technical assessor analyzing MCQ performance. Provide specific, actionable insights. Respond with valid JSON only."
+        },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.3,
+      responseFormat: { type: "json_object" },
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content || "";
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-    }
+    const parsed = llmProvider.parseJSON(res.content);
+    if (parsed) return parsed;
   } catch (e) {
-    console.error("Failed to generate MCQ analysis:", e);
+    console.error("Failed to generate MCQ analysis via Groq:", e);
   }
 
   return {

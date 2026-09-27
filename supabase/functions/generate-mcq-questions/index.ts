@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -6,10 +7,21 @@ const corsHeaders = {
 };
 
 interface GenerateRequest {
-  applicationId: string;
-  field: string;
-  toughnessLevel: number;
-  numQuestions: number;
+  applicationId?: string;
+  field?: string;
+  jobDescription?: string;
+  requiredSkills?: string[];
+  toughnessLevel?: number | string;
+  numQuestions?: number;
+}
+
+interface RawMCQ {
+  question: string;
+  options: string[];
+  correctAnswer: string;
+  skill?: string;
+  difficulty?: string;
+  explanation?: string;
 }
 
 serve(async (req) => {
@@ -18,93 +30,114 @@ serve(async (req) => {
   }
 
   try {
-    const { field, toughnessLevel, numQuestions } = await req.json() as GenerateRequest;
-    
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) {
-      throw new Error("LOVABLE_API_KEY is not configured");
-    }
+    const body = (await req.json()) as GenerateRequest;
+    const {
+      field = "Software Engineering",
+      jobDescription,
+      requiredSkills = [],
+      toughnessLevel = 3,
+      numQuestions = 5,
+    } = body;
 
-    const difficultyMap: Record<number, string> = {
-      1: "easy",
-      2: "easy to medium",
-      3: "medium",
-      4: "medium to hard",
-      5: "hard to expert",
+    const difficultyMap: Record<string, string> = {
+      "1": "easy",
+      "2": "easy to medium",
+      "3": "medium",
+      "4": "medium to hard",
+      "5": "hard to expert",
+      easy: "easy",
+      medium: "medium",
+      hard: "hard",
+      expert: "expert",
     };
 
-    const difficulty = difficultyMap[toughnessLevel] || "medium";
+    const diffString = difficultyMap[String(toughnessLevel)] || "medium";
+    const skillsList = requiredSkills.length > 0 ? requiredSkills.join(", ") : field;
 
-    const prompt = `Generate ${numQuestions} multiple-choice questions for a technical assessment in the field of "${field}" at ${difficulty} difficulty level.
+    const prompt = `You are an expert technical assessor creating multiple-choice questions for candidate evaluation.
 
-For each question, provide:
-1. A clear, concise question
-2. 4 answer options (exactly one correct for single-choice, or multiple correct for multi-select)
-3. The type (single or multiple)
-4. Difficulty (easy/medium/hard/expert)
-5. Topic/category
-6. Points (1-5 based on difficulty)
-7. Time limit in seconds (30-120 based on complexity)
+JOB FIELD: ${field}
+RELEVANT SKILLS: ${skillsList}
+${jobDescription ? `JOB DESCRIPTION: ${jobDescription.slice(0, 300)}` : ""}
+DIFFICULTY: ${diffString}
+NUMBER OF QUESTIONS: ${numQuestions}
 
-Return ONLY valid JSON in this exact format:
+Generate exactly ${numQuestions} high-quality, practical MCQs that test real-world technical competency.
+
+For each question, output:
+- question: Clear technical problem or scenario
+- options: Array of 4 distinct answers
+- correctAnswer: The exact matching string from options that is correct
+- skill: The specific skill/topic tested (e.g. React, SQL, Algorithms)
+- difficulty: "easy" | "medium" | "hard" | "expert"
+- explanation: Concise 1-2 sentence explanation of why the answer is correct
+
+Return ONLY valid JSON matching this schema:
 {
   "questions": [
     {
-      "id": "q-1",
-      "question": "What is the time complexity of binary search?",
-      "options": ["O(1)", "O(log n)", "O(n)", "O(n log n)"],
-      "type": "single",
-      "difficulty": "easy",
-      "topic": "Algorithms",
-      "points": 1,
-      "timeLimit": 45,
-      "correctAnswers": [1]
+      "question": "Which HTTP method is typically idempotent?",
+      "options": ["POST", "PUT", "PATCH", "CONNECT"],
+      "correctAnswer": "PUT",
+      "skill": "REST APIs",
+      "difficulty": "medium",
+      "explanation": "PUT is defined by HTTP specifications as idempotent because repeating the request results in the same resource state."
     }
   ]
-}
+}`;
 
-Make questions progressively harder. Include a mix of topics within the field.`;
-
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          { role: "user", content: prompt },
-        ],
-        response_format: { type: "json_object" },
-      }),
+    const res = await llmProvider.chat({
+      messages: [
+        { role: "system", content: "You are a professional technical exam author. Always output valid JSON." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.3,
+      maxTokens: 2000,
+      responseFormat: { type: "json_object" },
     });
 
-    if (!response.ok) {
-      if (response.status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limits exceeded" }), {
-          status: 429,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+    const parsed = llmProvider.parseJSON<{ questions: RawMCQ[] }>(res.content);
+    const rawQuestions = parsed?.questions || [];
+
+    // Validate and format structured output for client compatibility
+    const validatedQuestions = rawQuestions.map((q, idx) => {
+      const options = Array.isArray(q.options) && q.options.length === 4
+        ? q.options
+        : ["Option A", "Option B", "Option C", "Option D"];
+
+      let correctIndex = options.indexOf(q.correctAnswer);
+      if (correctIndex === -1) {
+        correctIndex = 0; // Default fallback to first option
       }
-      throw new Error(`AI gateway error: ${response.status}`);
-    }
 
-    const data = await response.json();
-    const content = data.choices[0].message.content;
-    const questions = JSON.parse(content);
-
-    return new Response(JSON.stringify(questions), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      return {
+        id: `mcq-${idx + 1}-${Date.now()}`,
+        question: q.question || `Technical question #${idx + 1}`,
+        options,
+        correctAnswer: q.correctAnswer || options[0],
+        correctAnswers: [correctIndex],
+        type: "single" as const,
+        skill: q.skill || field,
+        topic: q.skill || field,
+        difficulty: q.difficulty || "medium",
+        explanation: q.explanation || "Correct answer based on standard engineering principles.",
+        points: q.difficulty === "expert" ? 4 : q.difficulty === "hard" ? 3 : 2,
+        timeLimit: 60,
+      };
     });
+
+    return new Response(
+      JSON.stringify({ questions: validatedQuestions }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   } catch (error) {
-    console.error("Generate MCQ error:", error);
-    return new Response(JSON.stringify({ 
-      error: error instanceof Error ? error.message : "Unknown error",
-      questions: [] 
-    }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    console.error("[generate-mcq-questions] Error:", error);
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : "Failed to generate MCQs",
+        questions: [],
+      }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
   }
 });

@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -441,16 +442,10 @@ async function analyzeLinkedInProfile(linkedin_url: string): Promise<{
 
 async function getAIEnhancedAnalysis(
   currentAnalysis: ProfileAnalysis,
-  github_url: string | null,
-  linkedin_url: string | null
+  _github_url: string | null,
+  _linkedin_url: string | null
 ): Promise<{ skills: string[]; suggested_job_preferences: ProfileAnalysis['suggested_job_preferences'] }> {
   try {
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY");
-    if (!lovableApiKey) {
-      console.log("LOVABLE_API_KEY not configured, skipping AI enhancement");
-      return { skills: [], suggested_job_preferences: null };
-    }
-
     // Build context about the candidate
     const topReposInfo = currentAnalysis.github_analysis?.top_repos
       ?.map(r => `${r.name} (${r.language || 'unknown'}, ${r.stars} stars): ${r.description || 'no description'}`)
@@ -483,51 +478,24 @@ Return a JSON object with this exact structure:
 {
   "skills": ["Array of 15-25 technical skills based on the languages and common frameworks/tools used with them. Include the main languages AND their ecosystems."],
   "suggested_job_preferences": {
-    "fields": ["Top 2-3 job fields like 'Frontend Development', 'Backend Development', 'Full Stack', 'DevOps', 'AI/ML', 'Data Science', 'Mobile Development', 'Cloud Engineering"],
+    "fields": ["Top 2-3 job fields like 'Frontend Development', 'Backend Development', 'Full Stack', 'DevOps', 'AI/ML', 'Data Science', 'Mobile Development', 'Cloud Engineering'],
     "experience_level": "One of: 'entry', 'mid', 'senior', 'lead' based on account age, repo count, and activity",
     "suggested_roles": ["4-6 specific job titles that match their skills, like 'React Developer', 'Node.js Engineer', 'Python Developer', 'DevOps Engineer']
   }
-}
+}`;
 
-Important guidelines:
-- For skills, include the main languages AND their common frameworks/tools (e.g., JavaScript → React, Vue, Node.js, Express)
-- For experience_level: entry (0-2 years, < 10 repos), mid (2-5 years, 10-30 repos), senior (5-8 years, 30+ repos with stars), lead (8+ years, high contribution)
-- Be specific with suggested_roles based on their actual language expertise
-- Consider the repo descriptions and topics when inferring skills`;
-
-    const response = await fetch("https://api.lovable.dev/api/v1/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${lovableApiKey}`,
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-      }),
+    const res = await llmProvider.chat({
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      responseFormat: { type: "json_object" },
     });
 
-    if (!response.ok) {
-      console.error("AI API error:", response.status, await response.text());
-      return { skills: [], suggested_job_preferences: null };
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-    
-    if (content) {
-      try {
-        const parsed = JSON.parse(content);
-        console.log(`AI extracted ${parsed.skills?.length || 0} skills`);
-        return { 
-          skills: Array.isArray(parsed.skills) ? parsed.skills : [],
-          suggested_job_preferences: parsed.suggested_job_preferences || null
-        };
-      } catch (parseError) {
-        console.error("JSON parse error:", parseError);
-        return { skills: [], suggested_job_preferences: null };
-      }
+    const parsed = llmProvider.parseJSON(res.content);
+    if (parsed) {
+      return {
+        skills: Array.isArray(parsed.skills) ? parsed.skills : [],
+        suggested_job_preferences: parsed.suggested_job_preferences || null,
+      };
     }
 
     return { skills: [], suggested_job_preferences: null };

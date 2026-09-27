@@ -31,6 +31,10 @@ import {
   Webhook,
   Slack,
   Zap,
+  Bot,
+  Mic,
+  Cpu,
+  ShieldCheck,
 } from "lucide-react";
 
 export default function SettingsPage() {
@@ -333,11 +337,93 @@ export default function SettingsPage() {
 
         {/* Integrations */}
         <TabsContent value="integrations">
-          <div className="space-y-4">
+          <div className="space-y-6">
+            {/* AI & Voice Engine Status Card */}
+            <GlassCard>
+              <div className="mb-6 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Cpu className="h-5 w-5 text-primary" />
+                  <h2 className="text-lg font-semibold">AI & Voice Infrastructure</h2>
+                </div>
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-500">
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  Multi-Key Failover Protected
+                </span>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                {/* Groq LLM Engine Card */}
+                <div className="rounded-lg border border-border bg-card/50 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-orange-500/10 text-orange-500">
+                        <Bot className="h-5 w-5" />
+                      </div>
+                      <div>
+                        <h4 className="font-medium">Groq LLM Engine</h4>
+                        <p className="text-xs text-muted-foreground">High-Speed Reasoning Engine</p>
+                      </div>
+                    </div>
+                    <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-500 font-medium">
+                      Operational
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5 text-xs">
+                    <div className="flex justify-between py-1 border-b border-border/50">
+                      <span className="text-muted-foreground">Primary Model</span>
+                      <span className="font-mono font-medium">openai/gpt-oss-120b</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-border/50">
+                      <span className="text-muted-foreground">Key Architecture</span>
+                      <span className="text-foreground">Multi-Key Round-Robin</span>
+                    </div>
+                    <div className="flex justify-between py-1">
+                      <span className="text-muted-foreground">Rate-Limit Strategy</span>
+                      <span className="text-foreground">Automatic 429 Cooldown & Failover</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Bhashini Voice AI Card */}
+                <div className="rounded-lg border border-border bg-card/50 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-500/10 text-indigo-500">
+                        <Mic className="h-5 w-5" />
+                      </div>
+                      <div>
+                        <h4 className="font-medium">Bhashini Voice AI</h4>
+                        <p className="text-xs text-muted-foreground">ASR & TTS Voice Infrastructure</p>
+                      </div>
+                    </div>
+                    <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-500 font-medium">
+                      Active
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5 text-xs">
+                    <div className="flex justify-between py-1 border-b border-border/50">
+                      <span className="text-muted-foreground">Supported Languages</span>
+                      <span className="font-medium text-foreground">12 Indian Languages</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-border/50">
+                      <span className="text-muted-foreground">Capabilities</span>
+                      <span className="text-foreground">Bi-directional Speech-to-Text & TTS</span>
+                    </div>
+                    <div className="flex justify-between py-1">
+                      <span className="text-muted-foreground">Credential Security</span>
+                      <span className="text-foreground">Server-Side Protected</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </GlassCard>
+
             <GlassCard>
               <div className="mb-6 flex items-center gap-2">
                 <LinkIcon className="h-5 w-5 text-primary" />
-                <h2 className="text-lg font-semibold">API & Integrations</h2>
+                <h2 className="text-lg font-semibold">Third-Party Integrations</h2>
               </div>
 
               <div className="space-y-4">

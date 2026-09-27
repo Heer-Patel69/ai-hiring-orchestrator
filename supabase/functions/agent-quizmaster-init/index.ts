@@ -4,6 +4,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { llmProvider } from "../_shared/llm-provider.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -24,7 +25,6 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const lovableApiKey = Deno.env.get("LOVABLE_API_KEY")!;
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
@@ -70,7 +70,6 @@ serve(async (req) => {
 
     // Generate MCQ questions using AI
     const questions = await generateMCQQuestions(
-      lovableApiKey,
       job,
       roundConfig.num_questions
     );
@@ -135,7 +134,6 @@ function getDifficultyTimeLimit(difficulty: string): number {
 }
 
 async function generateMCQQuestions(
-  apiKey: string,
   job: any,
   numQuestions: number
 ) {
@@ -177,14 +175,8 @@ Cover various topics relevant to ${field}:
 
 Return a JSON array of question objects. Make questions challenging but fair.`;
 
-  const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "google/gemini-3-flash-preview",
+  try {
+    const res = await llmProvider.chat({
       messages: [
         {
           role: "system",
@@ -192,23 +184,12 @@ Return a JSON array of question objects. Make questions challenging but fair.`;
         },
         { role: "user", content: prompt },
       ],
-      temperature: 0.7,
-    }),
-  });
+      temperature: 0.3,
+    });
 
-  if (!response.ok) {
-    throw new Error(`AI API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-
-  try {
-    // Extract JSON array from response
-    const jsonMatch = content.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
+    const parsed = llmProvider.parseJSON(res.content);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && Array.isArray((parsed as any).questions)) return (parsed as any).questions;
   } catch (e) {
     console.error("Failed to parse AI response:", e);
   }
