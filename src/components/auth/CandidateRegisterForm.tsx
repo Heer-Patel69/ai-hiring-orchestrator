@@ -286,6 +286,9 @@ export function CandidateRegisterForm() {
         }),
         supabase.from("candidate_profiles").insert({
           user_id: userId,
+          // CRITICAL: store full_name and email so identity resolves without joining profiles
+          full_name: data.fullName,
+          email: data.email,
           phone_number: data.phoneNumber,
           github_url: data.githubUrl,
           linkedin_url: data.linkedinUrl,

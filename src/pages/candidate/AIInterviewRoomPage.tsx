@@ -83,14 +83,23 @@ export default function AIInterviewRoomPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { toast } = useToast();
-  const { speak, stop: stopSpeaking, isSpeaking: ttsIsSpeaking } = useTextToSpeech();
+  // voiceMode declared FIRST so TTS guard callbacks can reference it
+  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to Bhashini realtime voice
+  const { speak: _browserSpeak, stop: _browserStopSpeaking, isSpeaking: ttsIsSpeaking } = useTextToSpeech();
+  // When Bhashini (realtime) is active, suppress browser SpeechSynthesis to prevent dual-voice conflict
+  const speak = useCallback((text: string) => {
+    if (voiceMode !== "realtime") _browserSpeak(text);
+  }, [voiceMode, _browserSpeak]);
+  const stopSpeaking = useCallback(() => {
+    if (voiceMode !== "realtime") _browserStopSpeaking();
+    else window.speechSynthesis?.cancel(); // always cancel browser synth as safety net
+  }, [voiceMode, _browserStopSpeaking]);
 
   // Interview state
   const [status, setStatus] = useState<InterviewStatus>("preparing");
   const [interviewType] = useState<InterviewType>(
     (searchParams.get("type") as InterviewType) || "technical"
   );
-  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to Bhashini realtime voice
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -553,10 +562,12 @@ export default function AIInterviewRoomPage() {
     }
   };
 
-  // Part 11: Periodic AI reminder to share entire screen during preflight
+  // Part 11: Periodic reminder to share entire screen during preflight
+  // Only use browser TTS fallback in standard mode; in realtime mode Bhashini handles this.
   useEffect(() => {
     if (status !== "preparing") return;
     if (preflightScreenStatus === "entire_screen") return;
+    if (voiceMode === "realtime") return; // Bhashini handles voice prompts
 
     const interval = setInterval(() => {
       if (!ttsIsSpeaking) {
@@ -565,8 +576,7 @@ export default function AIInterviewRoomPage() {
     }, 13000);
 
     return () => clearInterval(interval);
-  }, [status, preflightScreenStatus, ttsIsSpeaking, speak]);
-
+  }, [status, preflightScreenStatus, ttsIsSpeaking, speak, voiceMode]);
   // Start interview with greeting and server timestamp initialization
   const startInterview = useCallback(async () => {
     setStatus("in-progress");

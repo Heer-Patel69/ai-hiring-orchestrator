@@ -18,7 +18,7 @@ serve(async (req) => {
   }
 
   try {
-    const { application_id, action, message, phase, code_submission } = await req.json();
+    const { application_id, action, message, phase, code_submission, transcript: clientTranscript } = await req.json();
 
     if (!application_id) {
       throw new Error("application_id is required");
@@ -162,17 +162,27 @@ serve(async (req) => {
     }
 
     if (action === "end_interview") {
-      // Fetch full transcript
-      const { data: fullTranscript } = await supabase
+      // Fetch full transcript from DB; supplement with client-provided transcript
+      const { data: dbTranscript } = await supabase
         .from("interview_transcripts")
         .select("*")
         .eq("application_id", application_id)
         .order("created_at");
 
+      // Merge DB transcript + any client-provided rows
+      const fullTranscript = dbTranscript && dbTranscript.length > 0
+        ? dbTranscript
+        : (clientTranscript || []).map((item: any) => ({
+            role: item.speaker === "ai" ? "ai" : "candidate",
+            content: item.text,
+            timestamp_ms: Math.round(item.timestamp || 0),
+            phase: "interview",
+          }));
+
       // Calculate interview duration
-      const startTime = new Date(application.agent_started_at || application.created_at).getTime();
+      const startTime = new Date(application.started_at || application.agent_started_at || application.applied_at).getTime();
       const endTime = Date.now();
-      const durationMinutes = Math.round((endTime - startTime) / 60000);
+      const durationMinutes = Math.max(1, Math.round((endTime - startTime) / 60000));
 
       // Evaluate entire interview
       const evaluation = await evaluateFullInterview(
@@ -193,12 +203,15 @@ serve(async (req) => {
 
       const roundConfig = job.round_config?.interview || { passing_score: 60 };
       const overallScore = evaluation.overall_score;
+      const passed = overallScore >= roundConfig.passing_score;
 
       let decision: "strong_pass" | "pass" | "borderline" | "reject";
       if (overallScore >= 80) decision = "strong_pass";
       else if (overallScore >= roundConfig.passing_score) decision = "pass";
       else if (overallScore >= roundConfig.passing_score - 10) decision = "borderline";
       else decision = "reject";
+
+      const completedAt = new Date().toISOString();
 
       // Store agent result
       const agentResult = {
@@ -229,31 +242,124 @@ serve(async (req) => {
         },
       };
 
-      await supabase.from("agent_results").insert(agentResult);
+      await supabase.from("agent_results").upsert(
+        { ...agentResult },
+        { onConflict: "application_id,agent_number", ignoreDuplicates: false }
+      );
 
-      // Store interview recording metadata
+      // Store/update interview recording metadata
       await supabase.from("interview_recordings").upsert({
         application_id,
+        candidate_id: application.candidate_id,
         transcript: fullTranscript,
         duration_minutes: durationMinutes,
         fraud_flags: fraudFlags,
+        status: "ready",
+        ended_at: completedAt,
       }, { onConflict: "application_id" });
 
-      // Update application status
-      if (decision === "strong_pass" || decision === "pass" || decision === "borderline") {
-        await supabase
-          .from("applications")
-          .update({
-            status: "completed",
-            current_agent: 6,
-          })
-          .eq("id", application_id);
-      } else {
-        await supabase
-          .from("applications")
-          .update({ status: "rejected" })
-          .eq("id", application_id);
+      // ------------------------------------------------------------------
+      // CRITICAL FIX: Determine the live interview round number
+      // The interview round is the LAST job_round with type = live_ai_interview
+      // If none found, treat it as round 1.
+      // ------------------------------------------------------------------
+      const { data: liveRound } = await supabase
+        .from("job_rounds")
+        .select("id, round_number")
+        .eq("job_id", job.id)
+        .eq("round_type", "live_ai_interview")
+        .order("round_number", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const interviewRoundNumber = liveRound?.round_number || 1;
+      const roundId = liveRound?.id || null;
+      const totalRounds = job.num_rounds || 1;
+      const isAllRoundsCompleted = interviewRoundNumber >= totalRounds;
+
+      // ------------------------------------------------------------------
+      // Upsert candidate_round_attempts for authoritative round tracking
+      // ------------------------------------------------------------------
+      const attemptStatus = passed ? "passed" : "failed";
+      await supabase.from("candidate_round_attempts").upsert({
+        candidate_id: application.candidate_id,
+        application_id,
+        job_id: job.id,
+        round_id: roundId,
+        round_number: interviewRoundNumber,
+        status: attemptStatus,
+        score: overallScore,
+        technical_score: evaluation.technical_score,
+        communication_score: evaluation.communication_score,
+        problem_solving_score: evaluation.problem_solving_score,
+        started_at: application.started_at || application.applied_at,
+        submitted_at: completedAt,
+        completed_at: completedAt,
+        termination_type: "normal",
+        ai_feedback: evaluation.reasoning,
+        strengths: evaluation.strengths || [],
+        weaknesses: evaluation.weaknesses || [],
+        transcript_snapshot: (fullTranscript || []).slice(-20), // store last 20 rows
+        updated_at: completedAt,
+      }, { onConflict: "application_id,round_number" });
+
+      // ------------------------------------------------------------------
+      // Upsert round_results for backward-compat with CandidateDetailModal
+      // ------------------------------------------------------------------
+      if (roundId) {
+        const { data: existingRoundResult } = await supabase
+          .from("round_results")
+          .select("id")
+          .eq("application_id", application_id)
+          .eq("round_id", roundId)
+          .maybeSingle();
+
+        if (existingRoundResult) {
+          await supabase.from("round_results")
+            .update({ score: overallScore, ai_feedback: evaluation.reasoning, completed_at: completedAt })
+            .eq("id", existingRoundResult.id);
+        } else {
+          const { data: newRR } = await supabase.from("round_results").insert({
+            application_id,
+            round_id: roundId,
+            score: overallScore,
+            ai_feedback: evaluation.reasoning,
+            completed_at: completedAt,
+          }).select("id").single();
+
+          if (newRR) {
+            await supabase.from("round_scores").upsert({
+              round_result_id: newRR.id,
+              application_id,
+              round_number: interviewRoundNumber,
+              base_score: overallScore,
+              final_score: overallScore,
+              strengths: evaluation.strengths || [],
+              weaknesses: evaluation.weaknesses || [],
+              updated_at: completedAt,
+            }, { onConflict: "round_result_id" });
+          }
+        }
       }
+
+      // ------------------------------------------------------------------
+      // Update application: ALWAYS set current_round >= 1 after interview
+      // ------------------------------------------------------------------
+      const newCurrentRound = Math.max(application.current_round || 0, interviewRoundNumber);
+      const newStatus = passed
+        ? (isAllRoundsCompleted ? "completed" : "interviewing")
+        : "rejected";
+
+      await supabase
+        .from("applications")
+        .update({
+          status: newStatus,
+          current_agent: passed ? 6 : 5,
+          current_round: newCurrentRound,
+          overall_score: overallScore,
+          completed_at: completedAt,
+        })
+        .eq("id", application_id);
 
       return new Response(
         JSON.stringify({

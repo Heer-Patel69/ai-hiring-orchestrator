@@ -81,12 +81,30 @@ interface RoundScoreData {
   } | null;
 }
 
+interface RoundAttemptData {
+  id: string;
+  round_number: number;
+  status: string;
+  score: number | null;
+  technical_score: number | null;
+  communication_score: number | null;
+  problem_solving_score: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+  ai_feedback: string | null;
+  strengths: string[] | null;
+  weaknesses: string[] | null;
+  termination_type: string | null;
+}
+
 interface CandidateDetails {
   profile: {
     full_name: string;
     email: string;
   } | null;
   candidateProfile: {
+    full_name: string | null;
+    email: string | null;
     phone_number: string;
     skills: string[] | null;
     experience_years: number | null;
@@ -110,6 +128,7 @@ interface CandidateDetails {
     overall_score: number | null;
     ai_confidence: number | null;
     current_round: number | null;
+    completed_at: string | null;
   } | null;
   job: {
     title: string;
@@ -128,6 +147,8 @@ interface CandidateDetails {
     improvement_suggestions: string[] | null;
   } | null;
   roundScores: RoundScoreData[];
+  roundAttempts: RoundAttemptData[];
+  recordingUrl: string | null;
 }
 
 export function CandidateDetailModal({
@@ -151,7 +172,7 @@ export function CandidateDetailModal({
     setIsLoading(true);
     try {
       // Fetch all data in parallel
-      const [profileRes, candidateProfileRes, applicationRes, scoresRes, roundScoresRes] = await Promise.all([
+      const [profileRes, candidateProfileRes, applicationRes, scoresRes, roundScoresRes, roundAttemptsRes, recordingRes] = await Promise.all([
         supabase
           .from("profiles")
           .select("full_name, email")
@@ -188,6 +209,16 @@ export function CandidateDetailModal({
           `)
           .eq("application_id", applicationId)
           .order("round_number", { ascending: true }),
+        supabase
+          .from("candidate_round_attempts")
+          .select("id, round_number, status, score, technical_score, communication_score, problem_solving_score, started_at, completed_at, ai_feedback, strengths, weaknesses, termination_type")
+          .eq("application_id", applicationId)
+          .order("round_number", { ascending: true }),
+        supabase
+          .from("interview_recordings")
+          .select("recording_url, status")
+          .eq("application_id", applicationId)
+          .maybeSingle(),
       ]);
 
       const jobData = applicationRes.data?.job as any;
@@ -220,11 +251,14 @@ export function CandidateDetailModal({
               overall_score: applicationRes.data.overall_score,
               ai_confidence: applicationRes.data.ai_confidence,
               current_round: applicationRes.data.current_round,
+              completed_at: applicationRes.data.completed_at,
             }
           : null,
         job: jobData,
         scores: scoresRes.data,
         roundScores: roundScoresData,
+        roundAttempts: (roundAttemptsRes.data || []) as RoundAttemptData[],
+        recordingUrl: recordingRes.data?.recording_url || null,
       });
     } catch (error) {
       console.error("Error fetching candidate details:", error);
@@ -243,6 +277,12 @@ export function CandidateDetailModal({
       profile: details?.profile,
       candidateProfile: details?.candidateProfile,
     });
+  };
+
+  const getEmail = (): string => {
+    return details?.profile?.email
+      || details?.candidateProfile?.email
+      || "";
   };
 
   const handleDownloadResume = async () => {
@@ -278,24 +318,42 @@ export function CandidateDetailModal({
     setIsExporting("pdf");
 
     try {
+      // Derive the best available interview date
+      const interviewDate =
+        details.application?.completed_at
+          ? new Date(details.application.completed_at).toLocaleDateString()
+          : details.roundAttempts?.[0]?.completed_at
+          ? new Date(details.roundAttempts[0].completed_at).toLocaleDateString()
+          : details.application?.applied_at
+          ? new Date(details.application.applied_at).toLocaleDateString()
+          : "N/A";
+
+      // Derive recommendation from actual score
+      const finalScore = details.scores?.final_score || details.application?.overall_score || 0;
+      const recommendationFromScore =
+        finalScore >= 70 ? "shortlist" : finalScore >= 50 ? "maybe" : "reject";
+
       downloadCandidateReport({
         candidateName: getCandidateName(),
-        email: details.profile?.email || "",
+        email: getEmail(),
         role: details.job?.title || "Unknown",
-        appliedDate: details.application?.applied_at
-          ? new Date(details.application.applied_at).toLocaleDateString()
-          : "N/A",
+        appliedDate: interviewDate,
         experience: details.candidateProfile?.experience_years
           ? `${details.candidateProfile.experience_years} years`
           : "N/A",
-        finalScore: details.scores?.final_score || details.application?.overall_score || 0,
-        technicalScore: details.scores?.technical_score || 0,
-        communicationScore: details.scores?.communication_score || 0,
-        problemSolvingScore: details.scores?.problem_solving_score || 0,
-        recommendation: (details.scores?.recommendation as any) || "shortlist",
-        recommendationReason: details.scores?.recommendation_reason || "Evaluation pending",
-        strengths: details.scores?.strengths || [],
-        weaknesses: details.scores?.weaknesses || [],
+        finalScore,
+        technicalScore: details.scores?.technical_score ||
+          details.roundAttempts?.[0]?.technical_score || 0,
+        communicationScore: details.scores?.communication_score ||
+          details.roundAttempts?.[0]?.communication_score || 0,
+        problemSolvingScore: details.scores?.problem_solving_score ||
+          details.roundAttempts?.[0]?.problem_solving_score || 0,
+        recommendation: (details.scores?.recommendation as any) || recommendationFromScore,
+        recommendationReason: details.scores?.recommendation_reason ||
+          details.roundAttempts?.[0]?.ai_feedback ||
+          "Evaluation based on AI interview performance",
+        strengths: details.scores?.strengths || details.roundAttempts?.[0]?.strengths || [],
+        weaknesses: details.scores?.weaknesses || details.roundAttempts?.[0]?.weaknesses || [],
         improvements: details.scores?.improvement_suggestions || [],
         roundScores: [],
       });
@@ -445,7 +503,7 @@ export function CandidateDetailModal({
                     <div className="mt-2 flex items-center gap-4 text-muted-foreground">
                       <span className="flex items-center gap-1">
                         <Mail className="h-4 w-4" />
-                        {details.profile?.email || "No email"}
+                        {getEmail() || "No email"}
                       </span>
                       <span className="flex items-center gap-1">
                         <Phone className="h-4 w-4" />
@@ -888,7 +946,21 @@ export function CandidateDetailModal({
 
             {/* Interview Rounds Tab */}
             <TabsContent value="rounds" className="space-y-4 mt-4">
-              {details.roundScores && details.roundScores.length > 0 ? (
+              {/* Recording Link if available */}
+              {details.recordingUrl && (
+                <GlassCard className="p-4">
+                  <h3 className="font-semibold mb-2 flex items-center gap-2">
+                    <CheckCircle2 className="h-5 w-5 text-success" />
+                    Interview Recording Available
+                  </h3>
+                  <a href={details.recordingUrl} target="_blank" rel="noopener noreferrer"
+                    className="text-primary hover:underline text-sm flex items-center gap-1">
+                    <ExternalLink className="h-4 w-4" /> View Recording
+                  </a>
+                </GlassCard>
+              )}
+              {/* Prefer round_scores; fallback to candidate_round_attempts */}
+              {(details.roundScores && details.roundScores.length > 0) ? (
                 <>
                   {/* Rounds Overview */}
                   <GlassCard className="p-4">
@@ -1138,6 +1210,116 @@ export function CandidateDetailModal({
                       </GlassCard>
                     );
                   })}
+                </>
+              ) : details.roundAttempts && details.roundAttempts.length > 0 ? (
+                <>
+                  <GlassCard className="p-4">
+                    <h3 className="font-semibold mb-4 flex items-center gap-2">
+                      <Target className="h-5 w-5 text-primary" />
+                      Interview Progress
+                    </h3>
+                    <div className="flex items-center gap-4 mb-4">
+                      <Progress
+                        value={(details.roundAttempts.filter(a => ["passed","failed","completed"].includes(a.status)).length / (details.job?.num_rounds || 1)) * 100}
+                        className="flex-1 h-3"
+                      />
+                      <span className="text-sm font-medium">
+                        {details.roundAttempts.length} / {details.job?.num_rounds || "?"} Rounds
+                      </span>
+                    </div>
+                  </GlassCard>
+                  {details.roundAttempts.map((attempt) => (
+                    <GlassCard key={attempt.id} className="p-4">
+                      <div className="flex items-start gap-6">
+                        <ScoreGauge
+                          score={attempt.score || 0}
+                          size="md"
+                          label={`Round ${attempt.round_number}`}
+                        />
+                        <div className="flex-1">
+                          <div className="flex items-center justify-between mb-2">
+                            <div>
+                              <h4 className="font-semibold text-lg">Round {attempt.round_number}</h4>
+                              <p className="text-sm text-muted-foreground capitalize">AI Interview</p>
+                            </div>
+                            <div className="text-right">
+                              <Badge
+                                variant="outline"
+                                className={
+                                  attempt.status === "passed"
+                                    ? "bg-success/10 text-success border-success/30"
+                                    : attempt.status === "failed"
+                                    ? "bg-danger/10 text-danger border-danger/30"
+                                    : "bg-warning/10 text-warning border-warning/30"
+                                }
+                              >
+                                {attempt.status === "passed" ? (
+                                  <><CheckCircle2 className="h-3 w-3 mr-1" /> Passed</>
+                                ) : attempt.status === "failed" ? (
+                                  <><AlertTriangle className="h-3 w-3 mr-1" /> Failed</>
+                                ) : (
+                                  <><Clock className="h-3 w-3 mr-1" /> {attempt.status}</>
+                                )}
+                              </Badge>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-3 gap-4 mt-4 text-sm">
+                            <div className="text-center p-2 rounded-lg bg-secondary/50">
+                              <div className="font-semibold">{attempt.technical_score || 0}%</div>
+                              <div className="text-muted-foreground text-xs">Technical</div>
+                            </div>
+                            <div className="text-center p-2 rounded-lg bg-secondary/50">
+                              <div className="font-semibold">{attempt.communication_score || 0}%</div>
+                              <div className="text-muted-foreground text-xs">Communication</div>
+                            </div>
+                            <div className="text-center p-2 rounded-lg bg-secondary/50">
+                              <div className="font-semibold">{attempt.problem_solving_score || 0}%</div>
+                              <div className="text-muted-foreground text-xs">Problem Solving</div>
+                            </div>
+                          </div>
+                          {attempt.ai_feedback && (
+                            <div className="mt-4 p-3 rounded-lg bg-primary/5 border border-primary/10">
+                              <h5 className="text-sm font-medium mb-1">AI Feedback</h5>
+                              <p className="text-sm text-muted-foreground">{attempt.ai_feedback}</p>
+                            </div>
+                          )}
+                          <div className="mt-4 grid grid-cols-2 gap-4 pt-4 border-t border-border">
+                            <div>
+                              <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                                <TrendingUp className="h-3 w-3 text-success" /> Strengths
+                              </h5>
+                              <ul className="space-y-1">
+                                {(attempt.strengths || []).slice(0, 3).map((s, i) => (
+                                  <li key={i} className="text-xs text-muted-foreground line-clamp-1">• {s}</li>
+                                ))}
+                                {(!attempt.strengths || attempt.strengths.length === 0) && (
+                                  <li className="text-xs text-muted-foreground italic">No strengths recorded</li>
+                                )}
+                              </ul>
+                            </div>
+                            <div>
+                              <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                                <TrendingDown className="h-3 w-3 text-warning" /> Areas to Improve
+                              </h5>
+                              <ul className="space-y-1">
+                                {(attempt.weaknesses || []).slice(0, 3).map((w, i) => (
+                                  <li key={i} className="text-xs text-muted-foreground line-clamp-1">• {w}</li>
+                                ))}
+                                {(!attempt.weaknesses || attempt.weaknesses.length === 0) && (
+                                  <li className="text-xs text-muted-foreground italic">No weaknesses recorded</li>
+                                )}
+                              </ul>
+                            </div>
+                          </div>
+                          {attempt.completed_at && (
+                            <p className="text-xs text-muted-foreground mt-3">
+                              Completed: {formatDate(attempt.completed_at)}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </GlassCard>
+                  ))}
                 </>
               ) : (
                 <GlassCard className="p-8 text-center">
