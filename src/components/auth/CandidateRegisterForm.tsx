@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
+import { extractResumeText } from "@/lib/resume-extractor";
 
 const formSchema = z.object({
   fullName: z.string().min(2, "Full name must be at least 2 characters"),
@@ -137,22 +138,12 @@ export function CandidateRegisterForm() {
     setIsParsingResume(true);
     
     try {
-      // Read file as base64
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => {
-          const result = reader.result as string;
-          const base64 = result.split(',')[1];
-          resolve(base64);
-        };
-        reader.onerror = reject;
-      });
-      reader.readAsDataURL(file);
-      const base64Content = await base64Promise;
+      // Robust client-side text extraction for PDF / DOCX
+      const { text } = await extractResumeText(file);
 
       // Call AI to parse resume directly
       const response = await supabase.functions.invoke("parse-resume-direct", {
-        body: { base64Content },
+        body: { text, fileName: file.name },
       });
 
       if (response.error) {
@@ -218,10 +209,12 @@ export function CandidateRegisterForm() {
       return;
     }
 
-    if (type === "resume" && file.type !== "application/pdf") {
+    const validExtensions = ["pdf", "docx", "doc"];
+    const ext = file.name.split(".").pop()?.toLowerCase();
+    if (type === "resume" && !validExtensions.includes(ext || "")) {
       toast({
         title: "Invalid file type",
-        description: "Please upload a PDF file",
+        description: "Please upload a PDF or DOCX file",
         variant: "destructive",
       });
       return;
@@ -434,7 +427,7 @@ export function CandidateRegisterForm() {
                     </div>
                     <input
                       type="file"
-                      accept=".pdf"
+                      accept=".pdf,.docx,.doc,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                       className="hidden"
                       onChange={(e) => handleFileChange(e, "resume")}
                       disabled={isParsingResume}

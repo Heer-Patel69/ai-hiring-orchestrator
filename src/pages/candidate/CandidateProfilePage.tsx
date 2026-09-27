@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import { extractResumeText } from "@/lib/resume-extractor";
 import {
   User,
   Mail,
@@ -24,6 +25,8 @@ import {
   Zap,
   CheckCircle,
   XCircle,
+  RefreshCw,
+  AlertCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Link } from "react-router-dom";
@@ -34,13 +37,22 @@ interface Profile {
 }
 
 interface CandidateProfile {
+  full_name?: string | null;
   phone_number: string;
   github_url: string | null;
   linkedin_url: string | null;
   resume_url: string | null;
   verification_status: string;
   verification_confidence: number | null;
+  skills: string[] | null;
+  experience_years?: number | null;
+  summary?: string | null;
+  education?: any[] | null;
+  projects?: any[] | null;
+  certifications?: any[] | null;
 }
+
+type ParsingStatus = "idle" | "uploaded" | "extracting" | "parsing" | "parsed" | "failed";
 
 export default function CandidateProfilePage() {
   const { user } = useAuth();
@@ -57,20 +69,11 @@ export default function CandidateProfilePage() {
   const [githubUrl, setGithubUrl] = useState("");
   const [linkedinUrl, setLinkedinUrl] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
+  const [parsingStatus, setParsingStatus] = useState<ParsingStatus>("idle");
+  const [parsingError, setParsingError] = useState<string | null>(null);
 
-  // AI-extracted skills (mock data for now)
-  const extractedSkills = [
-    "JavaScript",
-    "TypeScript",
-    "React",
-    "Node.js",
-    "Python",
-    "SQL",
-    "Git",
-    "Docker",
-    "AWS",
-    "REST APIs",
-  ];
+  // Dynamic real skills from profile
+  const [extractedSkills, setExtractedSkills] = useState<string[]>([]);
 
   useEffect(() => {
     if (user) {
@@ -97,19 +100,157 @@ export default function CandidateProfilePage() {
       setProfile(profileData);
       setCandidateProfile(candidateData);
 
-      if (profileData) {
+      if (profileData?.full_name) {
         setFullName(profileData.full_name);
+      } else if (candidateData?.full_name) {
+        setFullName(candidateData.full_name);
       }
+
       if (candidateData) {
-        setPhoneNumber(candidateData.phone_number);
+        setPhoneNumber(candidateData.phone_number || "");
         setGithubUrl(candidateData.github_url || "");
         setLinkedinUrl(candidateData.linkedin_url || "");
+        if (Array.isArray(candidateData.skills) && candidateData.skills.length > 0) {
+          setExtractedSkills(candidateData.skills);
+        }
       }
     } catch (error) {
       console.error("Error fetching profile:", error);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const parseUploadedResume = async (file: File) => {
+    setParsingError(null);
+    setParsingStatus("uploaded");
+
+    try {
+      setParsingStatus("extracting");
+      const { text } = await extractResumeText(file);
+
+      setParsingStatus("parsing");
+      const { data, error } = await supabase.functions.invoke("parse-resume-direct", {
+        body: {
+          text,
+          fileName: file.name,
+          userId: user?.id,
+        },
+      });
+
+      if (error) {
+        throw new Error(error.message || "Resume parsing failed");
+      }
+
+      const parsed = data?.data;
+      if (!parsed) {
+        throw new Error("No structured data returned from resume parser");
+      }
+
+      // Populate form fields if currently empty
+      if (parsed.fullName && (!fullName || fullName.trim() === "")) {
+        setFullName(parsed.fullName);
+      }
+      if (parsed.phone && (!phoneNumber || phoneNumber.trim() === "")) {
+        setPhoneNumber(parsed.phone);
+      }
+      if (parsed.github_url && !githubUrl) {
+        setGithubUrl(parsed.github_url);
+      }
+      if (parsed.linkedin_url && !linkedinUrl) {
+        setLinkedinUrl(parsed.linkedin_url);
+      }
+
+      if (Array.isArray(parsed.skills) && parsed.skills.length > 0) {
+        setExtractedSkills(parsed.skills);
+      }
+
+      // Upload file to Supabase storage
+      if (user) {
+        const fileExt = file.name.split(".").pop()?.toLowerCase() || "pdf";
+        const filePath = `${user.id}/resume.${fileExt}`;
+        await supabase.storage
+          .from("resumes")
+          .upload(filePath, file, { upsert: true });
+
+        // Update database records with structured data
+        if (parsed.fullName) {
+          await supabase
+            .from("profiles")
+            .update({ full_name: parsed.fullName })
+            .eq("user_id", user.id);
+        }
+
+        const candUpdates: any = {
+          resume_url: filePath,
+          skills: parsed.skills || [],
+          experience_years: parsed.experience_years || 0,
+          education: parsed.education || [],
+          projects: parsed.projects || [],
+          certifications: parsed.certifications || [],
+        };
+        if (parsed.fullName) candUpdates.full_name = parsed.fullName;
+        if (parsed.phone) candUpdates.phone_number = parsed.phone;
+        if (parsed.github_url) candUpdates.github_url = parsed.github_url;
+        if (parsed.linkedin_url) candUpdates.linkedin_url = parsed.linkedin_url;
+
+        await supabase
+          .from("candidate_profiles")
+          .update(candUpdates)
+          .eq("user_id", user.id);
+      }
+
+      setParsingStatus("parsed");
+      toast({
+        title: "Resume Parsed Successfully!",
+        description: `Identified ${parsed.fullName ? parsed.fullName + " • " : ""}${parsed.skills?.length || 0} skills, ${parsed.experience?.length || 0} work experiences.`,
+      });
+
+      // Refetch profile to display latest synchronized data
+      fetchProfile();
+    } catch (err: any) {
+      console.error("Resume parsing error:", err);
+      setParsingStatus("failed");
+      setParsingError(err.message || "Failed to parse resume");
+      toast({
+        title: "Resume Parsing Failed",
+        description: err.message || "Could not read resume. You may retry or fill your details manually.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleResumeChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const validTypes = [
+      "application/pdf",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/msword",
+    ];
+    const ext = file.name.split(".").pop()?.toLowerCase();
+
+    if (!validTypes.includes(file.type) && ext !== "pdf" && ext !== "docx" && ext !== "doc") {
+      toast({
+        title: "Invalid file type",
+        description: "Please upload a PDF or DOCX file.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      toast({
+        title: "File too large",
+        description: "Resume must be less than 10MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setResumeFile(file);
+    await parseUploadedResume(file);
   };
 
   const handleSave = async () => {
@@ -127,14 +268,19 @@ export default function CandidateProfilePage() {
 
       // Update candidate profile
       const updateData: any = {
+        full_name: fullName,
         phone_number: phoneNumber,
         github_url: githubUrl || null,
         linkedin_url: linkedinUrl || null,
       };
 
-      // Handle resume upload
-      if (resumeFile) {
-        const fileExt = resumeFile.name.split(".").pop();
+      if (extractedSkills.length > 0) {
+        updateData.skills = extractedSkills;
+      }
+
+      // Handle resume file upload if not already processed
+      if (resumeFile && parsingStatus !== "parsed") {
+        const fileExt = resumeFile.name.split(".").pop()?.toLowerCase() || "pdf";
         const filePath = `${user.id}/resume.${fileExt}`;
 
         const { error: uploadError } = await supabase.storage
@@ -170,128 +316,102 @@ export default function CandidateProfilePage() {
     }
   };
 
-  const handleResumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (file.type !== "application/pdf") {
-      toast({
-        title: "Invalid file type",
-        description: "Please upload a PDF file",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    if (file.size > 5 * 1024 * 1024) {
-      toast({
-        title: "File too large",
-        description: "Resume must be less than 5MB",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    setResumeFile(file);
-  };
-
   const getVerificationBadge = () => {
     if (!candidateProfile) return null;
 
-    const badges = {
-      verified: {
-        icon: ShieldCheck,
-        label: "Identity Verified",
-        description: "Your identity has been verified",
-        color: "text-success bg-success/10 border-success/30",
-      },
-      pending: {
-        icon: Shield,
-        label: "Verification Pending",
-        description: "Complete verification to apply for jobs",
-        color: "text-warning bg-warning/10 border-warning/30",
-      },
-      manual_review: {
-        icon: ShieldAlert,
-        label: "Under Review",
-        description: "Your verification is being reviewed manually",
-        color: "text-info bg-info/10 border-info/30",
-      },
-      rejected: {
-        icon: ShieldAlert,
-        label: "Verification Failed",
-        description: "Please try verifying again",
-        color: "text-danger bg-danger/10 border-danger/30",
-      },
-    };
-
-    return badges[candidateProfile.verification_status as keyof typeof badges] || badges.pending;
+    switch (candidateProfile.verification_status) {
+      case "verified":
+        return {
+          icon: ShieldCheck,
+          label: "Verified Candidate",
+          description: "Your identity has been verified via face & document check",
+          color: "text-success border-success/30 bg-success/10",
+        };
+      case "rejected":
+        return {
+          icon: ShieldAlert,
+          label: "Verification Failed",
+          description: "Please retry identity verification to apply for jobs",
+          color: "text-danger border-danger/30 bg-danger/10",
+        };
+      default:
+        return {
+          icon: Shield,
+          label: "Verification Pending",
+          description: "Complete face verification to unlock full platform features",
+          color: "text-warning border-warning/30 bg-warning/10",
+        };
+    }
   };
+
+  const verificationBadge = getVerificationBadge();
+  const VerificationIcon = verificationBadge?.icon || Shield;
 
   if (isLoading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-success border-t-transparent" />
+        <Loader2 className="h-8 w-8 animate-spin text-success" />
       </div>
     );
   }
-
-  const verificationBadge = getVerificationBadge();
-  const VerificationIcon = verificationBadge?.icon || Shield;
 
   return (
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold">My Profile</h1>
+        <h1 className="text-2xl font-bold">Candidate Profile</h1>
         <p className="text-muted-foreground">
-          Manage your personal information and preferences
+          Manage your personal information, resume, and credentials
         </p>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
         {/* Main Form */}
-        <div className="lg:col-span-2 space-y-6">
+        <div className="space-y-6 lg:col-span-2">
           {/* Personal Information */}
           <GlassCard>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <User className="h-5 w-5 text-success" />
-              Personal Information
-            </h2>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <div>
+            <h2 className="text-lg font-semibold mb-4">Personal Information</h2>
+            <div className="space-y-4">
+              <div className="space-y-2">
                 <Label htmlFor="fullName">Full Name</Label>
-                <Input
-                  id="fullName"
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                  className="mt-1"
-                />
-              </div>
-
-              <div>
-                <Label htmlFor="email">Email Address</Label>
-                <div className="relative mt-1">
-                  <Mail className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <div className="relative">
+                  <User className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
-                    id="email"
-                    value={profile?.email || ""}
-                    disabled
-                    className="pl-9 bg-secondary/50"
+                    id="fullName"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    placeholder="Enter your full legal name"
+                    className="pl-10"
                   />
                 </div>
               </div>
 
-              <div>
+              <div className="space-y-2">
+                <Label htmlFor="email">Email Address</Label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    id="email"
+                    value={profile?.email || ""}
+                    disabled
+                    className="pl-10 bg-secondary/50"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Email cannot be changed as it is linked to your account.
+                </p>
+              </div>
+
+              <div className="space-y-2">
                 <Label htmlFor="phone">Phone Number</Label>
-                <div className="relative mt-1">
-                  <Phone className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <div className="relative">
+                  <Phone className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
                     id="phone"
                     value={phoneNumber}
                     onChange={(e) => setPhoneNumber(e.target.value)}
-                    className="pl-9"
+                    placeholder="+91 98765 43210"
+                    className="pl-10"
                   />
                 </div>
               </div>
@@ -300,52 +420,63 @@ export default function CandidateProfilePage() {
 
           {/* Professional Links */}
           <GlassCard>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <ExternalLink className="h-5 w-5 text-success" />
-              Professional Links
-            </h2>
-
-            <div className="grid gap-4 md:grid-cols-2">
-              <div>
-                <Label htmlFor="github">GitHub Profile</Label>
-                <div className="relative mt-1">
-                  <Github className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <h2 className="text-lg font-semibold mb-4">Professional Profiles</h2>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="github">GitHub Profile URL</Label>
+                <div className="relative">
+                  <Github className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
                     id="github"
                     value={githubUrl}
                     onChange={(e) => setGithubUrl(e.target.value)}
                     placeholder="https://github.com/username"
-                    className="pl-9"
+                    className="pl-10"
                   />
                 </div>
               </div>
 
-              <div>
-                <Label htmlFor="linkedin">LinkedIn Profile</Label>
-                <div className="relative mt-1">
-                  <Linkedin className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <div className="space-y-2">
+                <Label htmlFor="linkedin">LinkedIn Profile URL</Label>
+                <div className="relative">
+                  <Linkedin className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
                     id="linkedin"
                     value={linkedinUrl}
                     onChange={(e) => setLinkedinUrl(e.target.value)}
                     placeholder="https://linkedin.com/in/username"
-                    className="pl-9"
+                    className="pl-10"
                   />
                 </div>
               </div>
             </div>
           </GlassCard>
 
-          {/* Resume */}
+          {/* Resume Upload & AI Parsing Status */}
           <GlassCard>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-              <FileText className="h-5 w-5 text-success" />
-              Resume
-            </h2>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-semibold">Resume & Credentials</h2>
+                <p className="text-sm text-muted-foreground">
+                  Upload your PDF or DOCX resume. AI extracts and populates your profile automatically.
+                </p>
+              </div>
+              {parsingStatus === "parsing" || parsingStatus === "extracting" ? (
+                <div className="flex items-center gap-2 text-xs text-primary font-medium">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {parsingStatus === "extracting" ? "Extracting Text..." : "AI Parsing..."}
+                </div>
+              ) : parsingStatus === "parsed" ? (
+                <div className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <CheckCircle className="h-4 w-4" />
+                  Parsed
+                </div>
+              ) : null}
+            </div>
 
             <div className="space-y-4">
               {candidateProfile?.resume_url && (
-                <div className="flex items-center justify-between rounded-lg bg-secondary/50 p-3">
+                <div className="flex items-center justify-between p-3 rounded-lg bg-secondary/50 border border-border">
                   <div className="flex items-center gap-3">
                     <FileText className="h-5 w-5 text-success" />
                     <div>
@@ -363,9 +494,43 @@ export default function CandidateProfilePage() {
                       target="_blank"
                       rel="noopener noreferrer"
                     >
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
                       View
                     </a>
                   </Button>
+                </div>
+              )}
+
+              {/* Parsing status bar */}
+              {parsingStatus === "extracting" && (
+                <div className="p-3 rounded-lg bg-primary/10 border border-primary/20 flex items-center gap-3">
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                  <span className="text-sm text-primary">Reading and extracting resume text...</span>
+                </div>
+              )}
+              {parsingStatus === "parsing" && (
+                <div className="p-3 rounded-lg bg-primary/10 border border-primary/20 flex items-center gap-3">
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                  <span className="text-sm text-primary">AI is analyzing skills, experience, and education...</span>
+                </div>
+              )}
+              {parsingStatus === "failed" && (
+                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-destructive text-sm">
+                    <AlertCircle className="h-4 w-4" />
+                    <span>{parsingError || "Parsing failed."}</span>
+                  </div>
+                  {resumeFile && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => parseUploadedResume(resumeFile)}
+                    >
+                      <RefreshCw className="mr-1 h-3 w-3" />
+                      Retry
+                    </Button>
+                  )}
                 </div>
               )}
 
@@ -381,20 +546,20 @@ export default function CandidateProfilePage() {
                   {resumeFile ? (
                     <>
                       <CheckCircle className="h-5 w-5 text-success" />
-                      <span className="text-sm">{resumeFile.name}</span>
+                      <span className="text-sm font-medium">{resumeFile.name}</span>
                     </>
                   ) : (
                     <>
                       <Upload className="h-5 w-5 text-muted-foreground" />
                       <span className="text-sm text-muted-foreground">
-                        Upload new resume (PDF only, max 5MB)
+                        Upload new resume (PDF or DOCX, max 10MB)
                       </span>
                     </>
                   )}
                 </div>
                 <input
                   type="file"
-                  accept=".pdf"
+                  accept=".pdf,.docx,.doc,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                   className="hidden"
                   onChange={handleResumeChange}
                 />
@@ -427,12 +592,7 @@ export default function CandidateProfilePage() {
           {/* Verification Status */}
           <GlassCard>
             <h2 className="text-lg font-semibold mb-4">Verification Status</h2>
-            <div
-              className={cn(
-                "rounded-lg border p-4",
-                verificationBadge?.color
-              )}
-            >
+            <div className={cn("rounded-lg border p-4", verificationBadge?.color)}>
               <div className="flex items-center gap-3">
                 <VerificationIcon className="h-6 w-6" />
                 <div>
@@ -460,23 +620,29 @@ export default function CandidateProfilePage() {
 
           {/* Skills */}
           <GlassCard>
-            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <h2 className="text-lg font-semibold mb-2 flex items-center gap-2">
               <Zap className="h-5 w-5 text-success" />
               Skills (AI Extracted)
             </h2>
             <p className="text-xs text-muted-foreground mb-3">
-              These skills were automatically extracted from your resume.
+              {extractedSkills.length > 0
+                ? "Extracted accurately from your verified resume."
+                : "Upload your resume to extract verified skills."}
             </p>
-            <div className="flex flex-wrap gap-2">
-              {extractedSkills.map((skill) => (
-                <span
-                  key={skill}
-                  className="rounded-full bg-success/10 px-3 py-1 text-sm font-medium text-success"
-                >
-                  {skill}
-                </span>
-              ))}
-            </div>
+            {extractedSkills.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {extractedSkills.map((skill) => (
+                  <span
+                    key={skill}
+                    className="rounded-full bg-success/10 px-3 py-1 text-sm font-medium text-success"
+                  >
+                    {skill}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground italic">No skills extracted yet</p>
+            )}
           </GlassCard>
 
           {/* Profile Completion */}
@@ -485,7 +651,8 @@ export default function CandidateProfilePage() {
             <div className="space-y-3">
               {[
                 { label: "Basic Info", completed: !!fullName && !!phoneNumber },
-                { label: "Resume Uploaded", completed: !!candidateProfile?.resume_url },
+                { label: "Resume Uploaded", completed: !!candidateProfile?.resume_url || !!resumeFile },
+                { label: "Skills Extracted", completed: extractedSkills.length > 0 },
                 { label: "GitHub Connected", completed: !!githubUrl },
                 { label: "LinkedIn Connected", completed: !!linkedinUrl },
                 { label: "Identity Verified", completed: candidateProfile?.verification_status === "verified" },

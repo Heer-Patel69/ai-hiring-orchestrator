@@ -45,6 +45,8 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
+import { submitRoundResult } from "@/lib/round-submission";
+import { useJobRoundConfig, useNextRound } from "@/hooks/useJobRoundConfig";
 
 interface CodingProblem {
   id: string;
@@ -118,6 +120,10 @@ export default function CodingChallengePage() {
   const { toast } = useToast();
 
   const applicationId = searchParams.get("application");
+  const { data: jobConfig } = useJobRoundConfig(applicationId);
+  const currentRoundNumber = jobConfig?.currentRoundNumber || 2;
+  const { data: nextRound } = useNextRound(applicationId, currentRoundNumber);
+  const [isAdvancing, setIsAdvancing] = useState(false);
 
   // Challenge state
   const [status, setStatus] = useState<ChallengeStatus>("loading");
@@ -130,6 +136,8 @@ export default function CodingChallengePage() {
   // Running state
   const [isRunning, setIsRunning] = useState(false);
   const [testResults, setTestResults] = useState<TestCase[]>([]);
+  const [compilerError, setCompilerError] = useState<string | null>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("problem");
 
   // Timer
@@ -149,6 +157,9 @@ export default function CodingChallengePage() {
 
   const currentProblem = problems[currentProblemIndex];
   const currentCode = codes[currentProblem?.id]?.[language] || defaultCode[language];
+
+  const getStorageKey = (problemId: string, lang: string) =>
+    `hireminds_code_${applicationId || "local"}_${problemId}_${lang}`;
 
   useEffect(() => {
     loadProblems();
@@ -254,10 +265,14 @@ Return the head of the merged linked list.`,
 
     setProblems(sampleProblems);
 
-    // Initialize codes
+    // Initialize codes with localStorage autosave recovery
     const initialCodes: Record<string, Record<string, string>> = {};
     sampleProblems.forEach((p) => {
-      initialCodes[p.id] = { ...defaultCode };
+      initialCodes[p.id] = {};
+      languages.forEach((langObj) => {
+        const saved = localStorage.getItem(getStorageKey(p.id, langObj.value));
+        initialCodes[p.id][langObj.value] = saved !== null ? saved : defaultCode[langObj.value];
+      });
     });
     setCodes(initialCodes);
 
@@ -271,18 +286,23 @@ Return the head of the merged linked list.`,
 
   const handleCodeChange = (value: string | undefined) => {
     if (!currentProblem) return;
+    const newCode = value || "";
     setCodes((prev) => ({
       ...prev,
       [currentProblem.id]: {
         ...prev[currentProblem.id],
-        [language]: value || "",
+        [language]: newCode,
       },
     }));
+    // Autosave to localStorage immediately on keystroke
+    localStorage.setItem(getStorageKey(currentProblem.id, language), newCode);
   };
 
   const runCode = async () => {
     if (!currentProblem) return;
     setIsRunning(true);
+    setCompilerError(null);
+    setRuntimeError(null);
     setActiveTab("output");
 
     try {
@@ -299,7 +319,14 @@ Return the head of the merged linked list.`,
 
       if (error) throw error;
 
-      const results: TestCase[] = data.testResults?.map((r: any, i: number) => ({
+      if (data?.compilerError) {
+        setCompilerError(data.compilerError);
+      }
+      if (data?.runtimeError) {
+        setRuntimeError(data.runtimeError);
+      }
+
+      const results: TestCase[] = data?.testResults?.map((r: any, i: number) => ({
         input: currentProblem.examples[i]?.input || "",
         expected: currentProblem.examples[i]?.output || "",
         actual: r.actual,
@@ -379,10 +406,10 @@ Return the head of the merged linked list.`,
 
   const handleTimeUp = () => {
     if (timerRef.current) clearInterval(timerRef.current);
-    finishChallenge();
+    void finishChallenge();
   };
 
-  const finishChallenge = () => {
+  const finishChallenge = async () => {
     setStatus("submitting");
 
     const problemScores = problems.map((p) => ({
@@ -398,11 +425,79 @@ Return the head of the merged linked list.`,
     }));
 
     const totalScore = Math.round(
-      problemScores.reduce((acc, ps) => acc + ps.submission.score, 0) / problems.length
+      problemScores.reduce((acc, ps) => acc + ps.submission.score, 0) / (problems.length || 1)
     );
+
+    const passingScore = jobConfig?.currentRound?.passing_score || 60;
+    const passed = totalScore >= passingScore;
+
+    // Persist to database using authoritative submitRoundResult!
+    if (applicationId) {
+      try {
+        const codeSubmissionsList = problemScores.map((ps) => ({
+          problem_id: ps.problem.id,
+          problem_title: ps.problem.title,
+          language: ps.submission.language,
+          code: ps.submission.code,
+          score: ps.submission.score,
+          time_taken_seconds: ps.submission.timeTaken,
+        }));
+
+        await submitRoundResult({
+          applicationId,
+          roundNumber: currentRoundNumber,
+          score: totalScore,
+          passingScore,
+          feedback: passed
+            ? `Candidate passed coding challenge with score ${totalScore}%. Algorithmic logic and test suites verified.`
+            : `Candidate scored ${totalScore}%, below passing threshold of ${passingScore}%.`,
+          strengths: ["Clean code structure", "Handled basic algorithmic cases"],
+          weaknesses: passed ? [] : ["Edge case validation", "Algorithmic optimization"],
+          detailedScores: {
+            technical: totalScore,
+            problemSolving: totalScore,
+            codeQuality: totalScore,
+          },
+          codeSubmissions: codeSubmissionsList,
+        });
+      } catch (err) {
+        console.error("Failed to submit coding round result:", err);
+      }
+    }
 
     setResults({ totalScore, problemScores });
     setStatus("completed");
+  };
+
+  const handleAdvanceToNext = async () => {
+    if (!applicationId || !nextRound) return;
+    setIsAdvancing(true);
+    try {
+      const { error } = await supabase
+        .from("applications")
+        .update({
+          current_round: nextRound.round_number,
+          status: "interviewing",
+        })
+        .eq("id", applicationId);
+
+      if (error) throw error;
+
+      const routeMap: Record<string, string> = {
+        mcq: "/candidate/assessment/mcq",
+        coding: "/candidate/assessment/coding",
+        behavioral: "/candidate/interview/live",
+        system_design: "/candidate/interview/live",
+        live_ai_interview: "/candidate/interview/live",
+      };
+
+      const route = routeMap[nextRound.round_type] || "/candidate/interview/live";
+      navigate(`${route}?application=${applicationId}`);
+    } catch (err) {
+      console.error("Error advancing to next round:", err);
+    } finally {
+      setIsAdvancing(false);
+    }
   };
 
   const formatTime = (seconds: number) => {
@@ -556,6 +651,40 @@ Return the head of the merged linked list.`,
               ))}
             </div>
 
+            {/* Next Round Button if Passed */}
+            {results.totalScore >= (jobConfig?.currentRound?.passing_score || 60) && nextRound && (
+              <div className="mb-6 p-4 rounded-xl bg-primary/10 border border-primary/30 text-left">
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="h-10 w-10 rounded-full bg-primary/20 flex items-center justify-center">
+                    <Sparkles className="h-5 w-5 text-primary" />
+                  </div>
+                  <div>
+                    <h4 className="font-semibold">Next: {nextRound.round_type.replace(/_/g, " ")}</h4>
+                    <p className="text-sm text-muted-foreground">
+                      Round {nextRound.round_number} • {nextRound.duration_minutes} minutes
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  onClick={handleAdvanceToNext}
+                  className="w-full bg-primary hover:bg-primary/90"
+                  disabled={isAdvancing}
+                >
+                  {isAdvancing ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading Next Assessment...
+                    </>
+                  ) : (
+                    <>
+                      Proceed to Next Round
+                      <ChevronRight className="ml-2 h-4 w-4" />
+                    </>
+                  )}
+                </Button>
+              </div>
+            )}
+
             <div className="flex gap-3">
               <Button variant="outline" className="flex-1" onClick={() => navigate("/candidate/applications")}>
                 View Applications
@@ -695,15 +824,35 @@ Return the head of the merged linked list.`,
               </Button>
             </TabsContent>
 
-            <TabsContent value="output" className="flex-1 overflow-auto p-4 m-0">
+            <TabsContent value="output" className="flex-1 overflow-auto p-4 m-0 space-y-3">
+              {compilerError && (
+                <div className="p-3.5 rounded-lg bg-danger/10 border border-danger/30 text-danger text-sm">
+                  <div className="flex items-center gap-2 font-semibold mb-1">
+                    <AlertTriangle className="h-4 w-4" />
+                    Compiler Error
+                  </div>
+                  <pre className="font-mono text-xs whitespace-pre-wrap">{compilerError}</pre>
+                </div>
+              )}
+
+              {runtimeError && (
+                <div className="p-3.5 rounded-lg bg-warning/10 border border-warning/30 text-warning text-sm">
+                  <div className="flex items-center gap-2 font-semibold mb-1">
+                    <AlertTriangle className="h-4 w-4" />
+                    Runtime Error
+                  </div>
+                  <pre className="font-mono text-xs whitespace-pre-wrap">{runtimeError}</pre>
+                </div>
+              )}
+
               {testResults.length > 0 ? (
                 <div className="space-y-3">
                   {testResults.map((result, i) => (
                     <div
                       key={i}
                       className={cn(
-                        "p-4 rounded-lg",
-                        result.passed ? "bg-success/10" : "bg-danger/10"
+                        "p-4 rounded-lg border",
+                        result.passed ? "bg-success/10 border-success/30" : "bg-danger/10 border-danger/30"
                       )}
                     >
                       <div className="flex items-center gap-2 mb-2">
@@ -712,22 +861,22 @@ Return the head of the merged linked list.`,
                         ) : (
                           <XCircle className="h-5 w-5 text-danger" />
                         )}
-                        <span className="font-medium">Test Case {i + 1}</span>
+                        <span className="font-medium">Test Case {i + 1}: {result.passed ? "Passed" : "Failed"}</span>
                       </div>
                       <div className="font-mono text-sm space-y-1">
                         <p><strong>Input:</strong> {result.input}</p>
                         <p><strong>Expected:</strong> {result.expected}</p>
-                        <p><strong>Got:</strong> {result.actual || "N/A"}</p>
+                        <p><strong>Received:</strong> {result.actual || "N/A"}</p>
                       </div>
                     </div>
                   ))}
                 </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center h-full text-center">
+              ) : !compilerError && !runtimeError ? (
+                <div className="flex flex-col items-center justify-center h-full text-center py-12">
                   <Terminal className="h-12 w-12 text-muted-foreground mb-4" />
-                  <p className="text-muted-foreground">Run your code to see output</p>
+                  <p className="text-muted-foreground">Run your code to see output and test results</p>
                 </div>
-              )}
+              ) : null}
             </TabsContent>
           </Tabs>
         </div>

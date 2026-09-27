@@ -32,6 +32,8 @@ export interface InterviewSessionContext {
   currentPhase?: "warmup" | "technical" | "scenario" | "candidate_questions" | "closing";
   history: Array<{ role: "user" | "assistant" | "system"; content: string }>;
   currentQuestionIndex?: number;
+  durationSeconds?: number;
+  remainingSeconds?: number;
 }
 
 export class InterviewOrchestrator {
@@ -55,6 +57,27 @@ export class InterviewOrchestrator {
   public buildSystemPrompt(ctx: InterviewSessionContext): string {
     const { candidate, job, currentPhase = "technical" } = ctx;
 
+    let timeBudgetInstructions = "";
+    if (ctx.durationSeconds) {
+      const durationMin = Math.round(ctx.durationSeconds / 60);
+      let questionBudget = "5 to 7 concise questions";
+      if (ctx.durationSeconds <= 120) {
+        questionBudget = "2 to 3 very concise questions total";
+      } else if (ctx.durationSeconds <= 300) {
+        questionBudget = "3 to 4 concise questions total";
+      }
+      timeBudgetInstructions += `\nTIME MANAGEMENT & QUESTION BUDGET:
+- Configured Round Duration: ${ctx.durationSeconds} seconds (~${durationMin} min).
+- Strict Question Budget: ${questionBudget}. Do not overload the candidate with long questions.`;
+    }
+
+    if (ctx.remainingSeconds !== undefined) {
+      timeBudgetInstructions += `\n- Authoritative Remaining Time: ${ctx.remainingSeconds} seconds.`;
+      if (ctx.remainingSeconds <= 30) {
+        timeBudgetInstructions += `\nCRITICAL TIME LIMIT: There are only ${ctx.remainingSeconds} seconds remaining! DO NOT start another technical question. Conclude gracefully with a warm, professional 2-sentence closing statement thanking them for their time.`;
+      }
+    }
+
     return `You are Alex, an expert Senior Technical Interviewer conducting a live, professional interview for the role of ${job.title}.
 Your demeanor is warm, professional, encouraging, yet intellectually rigorous.
 
@@ -72,6 +95,7 @@ CANDIDATE DOSSIER:
 ${candidate.projects?.length ? `- Candidate Notable Projects: ${candidate.projects.slice(0, 3).join("; ")}` : ""}
 ${candidate.githubHighlights?.length ? `- GitHub Highlights: ${candidate.githubHighlights.slice(0, 2).join("; ")}` : ""}
 ${candidate.resumeSummary ? `- Resume Summary: ${candidate.resumeSummary.slice(0, 250)}` : ""}
+${timeBudgetInstructions}
 
 CURRENT INTERVIEW PHASE: ${currentPhase.toUpperCase()}
 

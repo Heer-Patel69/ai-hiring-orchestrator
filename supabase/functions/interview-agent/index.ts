@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { groqKeyManager } from "../_shared/groq-key-manager.ts";
 import { interviewOrchestrator, InterviewSessionContext } from "../_shared/interview-orchestrator.ts";
 
@@ -14,6 +15,9 @@ interface InterviewMessage {
 
 interface InterviewRequest {
   messages: InterviewMessage[];
+  applicationId?: string;
+  durationSeconds?: number;
+  remainingSeconds?: number;
   jobField?: string;
   toughnessLevel?: "easy" | "medium" | "hard" | "expert";
   customQuestions?: string[];
@@ -47,6 +51,9 @@ serve(async (req) => {
     const body = (await req.json()) as InterviewRequest;
     const {
       messages = [],
+      applicationId,
+      durationSeconds = 120,
+      remainingSeconds,
       jobField = "Software Engineering",
       toughnessLevel = "medium",
       customQuestions = [],
@@ -60,10 +67,87 @@ serve(async (req) => {
       resumeSummary,
     } = body;
 
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    let authoritativeRemaining = remainingSeconds;
+
+    // Check server-authoritative timer if applicationId provided
+    if (applicationId) {
+      const { data: app } = await supabase
+        .from("applications")
+        .select("started_at, duration_seconds, expires_at, status")
+        .eq("id", applicationId)
+        .maybeSingle();
+
+      const now = Date.now();
+
+      if (app) {
+        if (!app.started_at || !app.expires_at) {
+          // Initialize server timer on first turn
+          const startedAt = new Date(now).toISOString();
+          const expiresAt = new Date(now + durationSeconds * 1000).toISOString();
+          await supabase
+            .from("applications")
+            .update({
+              started_at: startedAt,
+              duration_seconds: durationSeconds,
+              expires_at: expiresAt,
+              status: "interviewing",
+            })
+            .eq("id", applicationId);
+
+          authoritativeRemaining = durationSeconds;
+        } else {
+          // Calculate remaining seconds strictly from server timestamp
+          const expiryTime = new Date(app.expires_at).getTime();
+          authoritativeRemaining = Math.max(0, Math.floor((expiryTime - now) / 1000));
+
+          // If expired, reject new question and end interview
+          if (now >= expiryTime) {
+            const closingText = "Our scheduled interview time has concluded. Thank you for taking the time to speak with me today. Your responses have been submitted for evaluation.";
+            
+            // Persist closing transcript
+            await supabase.from("interview_transcripts").insert({
+              application_id: applicationId,
+              role: "ai",
+              content: closingText,
+              phase: "closing",
+              timestamp_ms: now,
+            });
+
+            return new Response(
+              `data: ${JSON.stringify({ choices: [{ delta: { content: closingText } }] })}\n\ndata: [DONE]\n\n`,
+              {
+                headers: {
+                  ...corsHeaders,
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                },
+              }
+            );
+          }
+        }
+      }
+
+      // Persist the candidate's latest message to transcript
+      const latestUserMsg = [...messages].reverse().find(m => m.role === "user");
+      if (latestUserMsg) {
+        await supabase.from("interview_transcripts").insert({
+          application_id: applicationId,
+          role: "candidate",
+          content: latestUserMsg.content,
+          phase: "technical",
+          timestamp_ms: now,
+        });
+      }
+    }
+
     const lastMessage = messages[messages.length - 1];
     const candidateEnding = lastMessage?.role === "user" && isEndingConversation(lastMessage.content);
 
-    // Build rich, structured context
+    // Build rich, structured context with server timer constraints
     const ctx: InterviewSessionContext = {
       candidate: {
         name: candidateName,
@@ -79,6 +163,8 @@ serve(async (req) => {
       },
       history: messages.map((m) => ({ role: m.role, content: m.content })),
       currentQuestionIndex,
+      durationSeconds,
+      remainingSeconds: authoritativeRemaining,
     };
 
     let systemPrompt = interviewOrchestrator.buildSystemPrompt(ctx);
@@ -124,11 +210,9 @@ The candidate wishes to finish the interview. Give a polite, warm, 2-sentence cl
       },
     });
   } catch (error) {
-    console.error("[interview-agent] Unexpected error:", error);
+    console.error("Error in interview-agent:", error);
     return new Response(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Unknown error in interview agent",
-      }),
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
       {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },

@@ -34,15 +34,26 @@ export interface VoiceMessage {
   timestamp: Date;
 }
 
+export interface LiveCaption {
+  speaker: "ai" | "candidate";
+  text: string;
+  isFinal: boolean;
+  timestamp?: number;
+}
+
 interface BhashiniVoiceAgentProps {
   jobField?: string;
   toughnessLevel?: string;
   jobTitle?: string;
   candidateName?: string;
   language?: string;
+  applicationId?: string;
+  durationSeconds?: number;
+  remainingSeconds?: number;
   onMessage?: (message: VoiceMessage) => void;
   onConnectionChange?: (connected: boolean) => void;
   onSpeakingChange?: (isSpeaking: boolean) => void;
+  onLiveCaption?: (caption: LiveCaption) => void;
   className?: string;
   autoConnect?: boolean;
 }
@@ -59,9 +70,13 @@ export function BhashiniVoiceAgent({
   jobTitle = "Software Engineer",
   candidateName,
   language = "en",
+  applicationId,
+  durationSeconds,
+  remainingSeconds,
   onMessage,
   onConnectionChange,
   onSpeakingChange,
+  onLiveCaption,
   className,
   autoConnect = false,
 }: BhashiniVoiceAgentProps) {
@@ -89,15 +104,23 @@ export function BhashiniVoiceAgent({
   const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
   const queueRef = useRef<AudioQueue | null>(null);
   const startedRef = useRef(false);
+  const remainingSecondsRef = useRef<number | undefined>(remainingSeconds);
 
   const onMessageRef = useRef(onMessage);
   const onConnectionChangeRef = useRef(onConnectionChange);
   const onSpeakingChangeRef = useRef(onSpeakingChange);
+  const onLiveCaptionRef = useRef(onLiveCaption);
+
+  useEffect(() => {
+    remainingSecondsRef.current = remainingSeconds;
+  }, [remainingSeconds]);
+
   useEffect(() => {
     onMessageRef.current = onMessage;
     onConnectionChangeRef.current = onConnectionChange;
     onSpeakingChangeRef.current = onSpeakingChange;
-  }, [onMessage, onConnectionChange, onSpeakingChange]);
+    onLiveCaptionRef.current = onLiveCaption;
+  }, [onMessage, onConnectionChange, onSpeakingChange, onLiveCaption]);
 
   useEffect(() => {
     mutedRef.current = muted;
@@ -130,7 +153,7 @@ export function BhashiniVoiceAgent({
     [language]
   );
 
-  /** Streams the interviewer reply and speaks each sentence the moment it's ready. */
+  /** Streams the interviewer reply, emits real-time live captions, and speaks each sentence */
   const respond = useCallback(
     async (userText: string) => {
       historyRef.current.push({ role: "user", content: userText });
@@ -154,6 +177,9 @@ export function BhashiniVoiceAgent({
             jobField,
             toughnessLevel,
             jobTitle,
+            applicationId,
+            durationSeconds,
+            remainingSeconds: remainingSecondsRef.current ?? remainingSeconds,
           }),
         });
 
@@ -180,6 +206,15 @@ export function BhashiniVoiceAgent({
               if (!delta) continue;
               full += delta;
               buffer += delta;
+
+              // Emit real-time streaming caption for AI speaking
+              onLiveCaptionRef.current?.({
+                speaker: "ai",
+                text: full,
+                isFinal: false,
+                timestamp: Date.now(),
+              });
+
               let cut = extractSpeakableChunk(buffer);
               while (cut) {
                 pending.push(speak(cut.chunk));
@@ -198,6 +233,12 @@ export function BhashiniVoiceAgent({
         if (full.trim()) {
           historyRef.current.push({ role: "assistant", content: full });
           pushMessage("assistant", full.trim());
+          onLiveCaptionRef.current?.({
+            speaker: "ai",
+            text: full.trim(),
+            isFinal: true,
+            timestamp: Date.now(),
+          });
         }
       } catch (e) {
         console.error("Interview agent stream failed:", e);
@@ -210,7 +251,7 @@ export function BhashiniVoiceAgent({
         setIsThinking(false);
       }
     },
-    [jobField, jobTitle, toughnessLevel, speak, pushMessage, toast]
+    [jobField, jobTitle, toughnessLevel, applicationId, durationSeconds, remainingSeconds, speak, pushMessage, toast]
   );
 
   const transcribeAndRespond = useCallback(
@@ -228,6 +269,14 @@ export function BhashiniVoiceAgent({
 
         const transcript = (data?.transcript ?? "").trim();
         if (transcript.length < 2) return;
+
+        // Emit candidate spoken caption immediately
+        onLiveCaptionRef.current?.({
+          speaker: "candidate",
+          text: transcript,
+          isFinal: true,
+          timestamp: Date.now(),
+        });
 
         pushMessage("user", transcript);
         await respond(transcript);
@@ -340,6 +389,12 @@ export function BhashiniVoiceAgent({
         : `Hello, I'm Alex, your AI interviewer for the ${jobTitle} role. Let's begin — tell me when you're ready.`;
       pushMessage("assistant", greeting);
       historyRef.current.push({ role: "assistant", content: greeting });
+      onLiveCaptionRef.current?.({
+        speaker: "ai",
+        text: greeting,
+        isFinal: true,
+        timestamp: Date.now(),
+      });
       void speak(greeting);
     } catch (e) {
       console.error("Failed to start voice session:", e);
@@ -363,6 +418,13 @@ export function BhashiniVoiceAgent({
     onConnectionChangeRef.current?.(false);
     onSpeakingChangeRef.current?.(false);
   }, [stopCapture]);
+
+  // Stop immediately if remaining seconds reach 0
+  useEffect(() => {
+    if (remainingSeconds !== undefined && remainingSeconds <= 0 && activeRef.current) {
+      stop();
+    }
+  }, [remainingSeconds, stop]);
 
   useEffect(() => {
     if (autoConnect && !startedRef.current) {

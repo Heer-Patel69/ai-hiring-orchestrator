@@ -15,6 +15,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { downloadCandidateReport } from "@/lib/pdf-generator";
 import { downloadCandidatePPT } from "@/lib/ppt-generator";
+import { getCandidateDisplayName } from "@/lib/candidate-utils";
 import {
   User,
   Mail,
@@ -238,9 +239,10 @@ export function CandidateDetailModal({
   };
 
   const getCandidateName = (): string => {
-    if (details?.profile?.full_name) return details.profile.full_name;
-    if (details?.profile?.email) return details.profile.email.split("@")[0];
-    return "Unknown Candidate";
+    return getCandidateDisplayName({
+      profile: details?.profile,
+      candidateProfile: details?.candidateProfile,
+    });
   };
 
   const handleDownloadResume = async () => {

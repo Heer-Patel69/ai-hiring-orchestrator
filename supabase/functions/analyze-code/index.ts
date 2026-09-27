@@ -46,10 +46,14 @@ Respond in JSON format:
   "spaceComplexity": "O(...)",
   "codeQuality": number,
   "testResults": [{"passed": boolean, "actual": string, "expected": string}],
+  "compilerError": string | null,
+  "runtimeError": string | null,
   "suggestions": ["suggestion1", "suggestion2"],
   "overallScore": number,
   "explanation": "brief explanation"
-}`;
+}
+If the code contains syntax, import, or typing errors, populate "compilerError" with the exact error message.
+If the code would throw an unhandled exception or crash at runtime, populate "runtimeError".`;
 
     const res = await llmProvider.chat({
       messages: [

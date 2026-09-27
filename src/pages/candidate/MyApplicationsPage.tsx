@@ -243,7 +243,7 @@ export default function MyApplicationsPage() {
                           )}
                           <div className="text-center">
                             <div className="text-lg font-bold">
-                              {app.current_round}/{app.job?.num_rounds || 0}
+                              {Math.max(app.current_round || 0, (app.round_results || []).filter((r) => !!r.completed_at).length)}/{app.job?.num_rounds || 0}
                             </div>
                             <div className="text-xs text-muted-foreground">Rounds</div>
                           </div>
@@ -266,8 +266,14 @@ export default function MyApplicationsPage() {
                                   (r) => r.round?.round_number === idx + 1
                                 );
                                 const isCompleted = !!roundResult?.completed_at;
-                                const isUnlocked = idx <= app.current_round;
-                                const isCurrent = idx === app.current_round && app.status === "interviewing";
+                                const isUnlocked = idx <= (app.current_round || 0);
+                                const isCurrent = idx === (app.current_round || 0) && (app.status === "interviewing" || app.status === "applied" || app.status === "screening");
+
+                                const getRoundRoute = (roundType?: string) => {
+                                  if (roundType === "coding") return `/candidate/assessment/coding?application=${app.id}`;
+                                  if (roundType === "mcq") return `/candidate/assessment/mcq?application=${app.id}`;
+                                  return `/candidate/interview/live?application=${app.id}`;
+                                };
 
                                 return (
                                   <div key={idx} className="relative flex items-start gap-4 pl-2">
@@ -310,7 +316,7 @@ export default function MyApplicationsPage() {
                                         </div>
                                         {isCurrent && (
                                           <Button size="sm" className="bg-success hover:bg-success/90" asChild>
-                                            <Link to="/candidate/interview">
+                                            <Link to={getRoundRoute(roundResult?.round?.round_type)}>
                                               <PlayCircle className="mr-1 h-3 w-3" />
                                               Start
                                             </Link>

@@ -29,6 +29,7 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import { getCandidateDisplayName } from "@/lib/candidate-utils";
 
 interface Candidate {
   id: string;
@@ -156,7 +157,7 @@ export default function CandidatesPage() {
           .in("user_id", candidateIds),
         supabase
           .from("candidate_profiles")
-          .select("user_id, phone_number, github_url, linkedin_url, verification_status, profile_score")
+          .select("user_id, full_name, skills, phone_number, github_url, linkedin_url, verification_status, profile_score")
           .in("user_id", candidateIds),
         supabase
           .from("job_rounds")
@@ -192,46 +193,14 @@ export default function CandidatesPage() {
           ? Math.max(0, testsCompleted - 1) 
           : testsCompleted;
 
-        // Determine display name with robust fallback chain
-        let displayName = "";
-        
-        // 1. First try full_name from profiles table
-        if (profile && profile.full_name && typeof profile.full_name === 'string') {
-          const trimmedName = profile.full_name.trim();
-          if (trimmedName.length > 0) {
-            displayName = trimmedName;
-          }
-        }
-        
-        // 2. If no name, try to extract from email
-        if (!displayName && profile?.email) {
-          const emailName = profile.email.split('@')[0];
-          // Handle common email patterns: john.doe, john_doe, johndoe
-          displayName = emailName
-            .replace(/[._-]/g, ' ')
-            .split(' ')
-            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-            .join(' ')
-            .trim();
-        }
-        
-        // 3. If still no name, try to use phone number
-        if (!displayName && candProfile?.phone_number) {
-          const phone = candProfile.phone_number;
-          displayName = `Candidate (${phone.slice(-4)})`;
-        }
-        
-        // 4. Final fallback - use application ID
-        if (!displayName) {
-          displayName = `Applicant #${app.id.slice(0, 6).toUpperCase()}`;
-        }
-        
-        const hasProfile = !!(profile?.full_name && profile.full_name.trim().length > 0);
+        // Canonical identity resolution (never uses phone slice numbers)
+        const displayName = getCandidateDisplayName(profile, candProfile, null, profile?.email);
+        const hasProfile = displayName !== "Candidate";
 
         return {
           id: app.id,
           name: displayName,
-          email: profile?.email || "No email provided",
+          email: profile?.email || "candidate@hireminds.ai",
           phone: candProfile?.phone_number || "",
           job: (app.jobs as any)?.title || "Unknown",
           jobId: app.job_id,

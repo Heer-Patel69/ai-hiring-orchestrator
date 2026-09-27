@@ -40,6 +40,7 @@ import { useJobRoundConfig, useNextRound } from "@/hooks/useJobRoundConfig";
 import { AssessmentComplete } from "@/components/assessment/AssessmentComplete";
 import { useAntiCheat } from "@/hooks/useAntiCheat";
 import { AntiCheatOverlay, AntiCheatStatusBadge } from "@/components/proctoring";
+import { submitRoundResult } from "@/lib/round-submission";
 
 interface MCQQuestion {
   id: string;
@@ -506,21 +507,44 @@ export default function MCQAssessmentPage() {
 
       // Save results to database
       if (applicationId) {
-        // Update application with score and status
-        const { error: updateError } = await supabase
-          .from("applications")
-          .update({
-            overall_score: score,
-            current_round: passed ? (currentRoundNumber + 1) : currentRoundNumber,
-            status: passed ? "interviewing" : "rejected",
-          })
-          .eq("id", applicationId);
+        // Build question-level scores for database persistence
+        const questionScoresData = responseData.map((r, idx) => ({
+          questionNumber: idx + 1,
+          questionText: r.question,
+          candidateAnswer: (r.selectedOptions || []).map((optIdx) => questions[idx]?.options[optIdx] || optIdx).join(", "),
+          score: r.isCorrect ? 10 : 0,
+          feedback: r.isCorrect ? "Correct answer selected." : "Incorrect selection.",
+          timeTakenSeconds: r.timeTaken,
+        }));
 
-        if (updateError) {
-          console.error("Error updating application:", updateError);
+        // Authoritatively persist round result, round scores, question scores, and update current_round!
+        try {
+          await submitRoundResult({
+            applicationId,
+            roundNumber: currentRoundNumber,
+            score,
+            passingScore,
+            feedback: passed
+              ? `Candidate scored ${score}% (passing: ${passingScore}%). Strong performance in screening.`
+              : `Score ${score}% below passing threshold of ${passingScore}%.`,
+            strengths: Object.entries(topicBreakdown)
+              .filter(([_, d]) => d.correct === d.total && d.total > 0)
+              .map(([topic]) => `Mastery in ${topic}`),
+            weaknesses: Object.entries(topicBreakdown)
+              .filter(([_, d]) => d.correct < d.total)
+              .map(([topic]) => `Review ${topic}`),
+            detailedScores: {
+              technical: score,
+              accuracy: score,
+            },
+            questionScores: questionScoresData,
+            proctoringEventsCount: antiCheat.tabSwitchCount,
+          });
+        } catch (subErr) {
+          console.error("Failed to submit round result via submitRoundResult:", subErr);
         }
 
-        // Store agent result for tracking
+        // Store agent result for legacy tracking
         try {
           await supabase.from("agent_results").insert({
             application_id: applicationId,

@@ -11,6 +11,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { CandidateDetailModal } from "@/components/dashboard/CandidateDetailModal";
+import { getCandidateDisplayName } from "@/lib/candidate-utils";
 import {
   Select,
   SelectContent,
@@ -68,6 +69,7 @@ interface Applicant {
   fraud_flags: any;
   candidate_profile: {
     user_id: string;
+    full_name?: string | null;
     phone_number: string;
     skills: string[] | null;
     experience_years: number | null;
@@ -162,7 +164,7 @@ export default function JobApplicantsPage() {
           // Get candidate profile
           const { data: candidateProfile } = await supabase
             .from("candidate_profiles")
-            .select("user_id, phone_number, skills, experience_years, github_url, linkedin_url, profile_score, verification_status, resume_url")
+            .select("user_id, full_name, phone_number, skills, experience_years, github_url, linkedin_url, profile_score, verification_status, resume_url")
             .eq("user_id", app.candidate_id)
             .single();
 
@@ -224,10 +226,10 @@ export default function JobApplicantsPage() {
   };
 
   const getCandidateName = (applicant: Applicant): string => {
-    if (applicant.profile?.full_name) return applicant.profile.full_name;
-    if (applicant.profile?.email) return applicant.profile.email.split("@")[0];
-    if (applicant.candidate_profile?.phone_number) return applicant.candidate_profile.phone_number;
-    return `Candidate ${applicant.candidate_id.slice(0, 8)}`;
+    return getCandidateDisplayName({
+      profile: applicant.profile,
+      candidateProfile: applicant.candidate_profile,
+    });
   };
 
   const getInitials = (name: string): string => {
