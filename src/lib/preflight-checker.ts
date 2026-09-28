@@ -76,7 +76,8 @@ export interface ScreenShareVerification {
 
 /**
  * Verifies that the display media track represents an entire monitor.
- * Strictly rejects individual application windows or browser tabs.
+ * Strictly rejects individual application windows (e.g., Antigravity, IDEs, browsers)
+ * or browser tabs.
  */
 export function verifyEntireScreenShare(stream: MediaStream): ScreenShareVerification {
   const videoTrack = stream.getVideoTracks()[0];
@@ -89,8 +90,10 @@ export function verifyEntireScreenShare(stream: MediaStream): ScreenShareVerific
   }
 
   const settings = videoTrack.getSettings() as any;
-  const displaySurface: string = settings.displaySurface || "";
+  const label = (videoTrack.label || "").toLowerCase();
+  const displaySurface: string = (settings.displaySurface || "").toLowerCase();
 
+  // 1. Explicit detection from track settings displaySurface
   if (displaySurface === "browser") {
     return {
       isValid: false,
@@ -103,35 +106,74 @@ export function verifyEntireScreenShare(stream: MediaStream): ScreenShareVerific
     return {
       isValid: false,
       surface: "window",
-      message: "Incorrect sharing mode. You selected an application window. Please select ENTIRE SCREEN.",
+      message: "Incorrect sharing mode. You selected an individual application window. You must share your ENTIRE SCREEN.",
     };
   }
 
-  if (displaySurface === "monitor") {
+  // 2. Explicit detection from Chromium track label
+  // Chromium formats labels as:
+  // "screen:0:0" / "screen:1:0" / "Screen 1" / "Entire screen" -> Entire screen (monitor)
+  // "window:12345:0" / "window:..." / application title -> Individual window
+  // "web-contents-media-stream:..." -> Browser tab
+  if (label.includes("window:") || label.startsWith("window")) {
+    return {
+      isValid: false,
+      surface: "window",
+      message: "Incorrect sharing mode. You selected an individual application window. You must share your ENTIRE SCREEN.",
+    };
+  }
+
+  if (label.includes("web-contents") || label.includes("tab:") || label.startsWith("tab")) {
+    return {
+      isValid: false,
+      surface: "browser",
+      message: "Incorrect sharing mode. You selected a browser tab. Please select ENTIRE SCREEN.",
+    };
+  }
+
+  // If displaySurface is "monitor" or label explicitly indicates screen
+  if (displaySurface === "monitor" || label.startsWith("screen") || label.includes("screen:") || label.includes("entire screen")) {
     return {
       isValid: true,
       surface: "monitor",
     };
   }
 
-  // Fallback for browsers that do not report displaySurface
-  // Heuristic: compare track width/height against screen dimensions
+  // 3. If displaySurface is reported and is NOT monitor, reject it
+  if (displaySurface && displaySurface !== "monitor") {
+    return {
+      isValid: false,
+      surface: (displaySurface as DisplaySurfaceType) || "unknown",
+      message: `Sharing surface '${displaySurface}' is not permitted. Please select ENTIRE SCREEN.`,
+    };
+  }
+
+  // 4. Strict resolution verification for legacy browsers that omit displaySurface
+  // Note: An individual maximized window does NOT match the full native screen dimensions
+  // because of the Windows/OS taskbar, window border, and chrome.
   const trackWidth = settings.width || 0;
   const trackHeight = settings.height || 0;
   const screenWidth = window.screen.width;
   const screenHeight = window.screen.height;
+  const dpr = window.devicePixelRatio || 1;
+  const expectedWidth = Math.round(screenWidth * dpr);
+  const expectedHeight = Math.round(screenHeight * dpr);
 
-  // If width is roughly within 10% of monitor resolution, accept as monitor
-  if (trackWidth >= screenWidth * 0.85 && trackHeight >= screenHeight * 0.85) {
+  const matchesExactMonitor = 
+    (trackWidth === screenWidth && trackHeight === screenHeight) ||
+    (trackWidth === expectedWidth && trackHeight === expectedHeight);
+
+  if (matchesExactMonitor) {
     return {
       isValid: true,
       surface: "monitor",
     };
   }
 
-  // If we cannot verify, provide clear guidance
+  // Reject anything that cannot be proven to be the entire screen
   return {
-    isValid: true, // Allow fallback if displaySurface is omitted by older browser
-    surface: "monitor",
+    isValid: false,
+    surface: "unknown",
+    message: "Could not verify that the entire screen is being shared. Please choose 'Entire Screen' when prompted.",
   };
 }

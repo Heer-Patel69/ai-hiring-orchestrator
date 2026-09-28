@@ -134,6 +134,11 @@ export default function AIInterviewRoomPage() {
   const [preflightScreenStatus, setPreflightScreenStatus] = useState<"not_shared" | "wrong_surface" | "entire_screen" | "stopped">("not_shared");
   const [preflightScreenError, setPreflightScreenError] = useState<string | null>(null);
   const [isScreenInterrupted, setIsScreenInterrupted] = useState<boolean>(false);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const statusRef = useRef<InterviewStatus>(status);
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // Mobile state for panel visibility - MUST be declared here with other hooks
   const [mobilePanel, setMobilePanel] = useState<"video" | "code" | null>(null);
@@ -480,6 +485,15 @@ export default function AIInterviewRoomPage() {
   // Handle candidate entire-screen sharing request
   const handleRequestScreenShare = async () => {
     try {
+      // Clean up previous screen tracks so their onended event doesn't fire and race
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
+        screenStreamRef.current = null;
+      }
+
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { displaySurface: "monitor" } as any,
         audio: false,
@@ -487,22 +501,39 @@ export default function AIInterviewRoomPage() {
 
       const check = verifyEntireScreenShare(stream);
       if (!check.isValid) {
-        stream.getTracks().forEach((t) => t.stop());
+        stream.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
         setPreflightScreenStatus("wrong_surface");
         setPreflightScreenError(check.message || "Please select your ENTIRE SCREEN.");
         proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.message || "Non-monitor surface selected");
         return;
       }
 
+      screenStreamRef.current = stream;
       setScreenStream(stream);
       setPreflightScreenStatus("entire_screen");
       setPreflightScreenError(null);
+      setIsScreenInterrupted(false);
       proctoringLogger.logProctoringEvent("screen_share_started", "low", "Candidate shared entire screen (monitor)");
 
       const displayTrack = stream.getVideoTracks()[0];
       if (displayTrack) {
         displayTrack.onended = () => {
-          handleScreenShareInterrupted();
+          if (screenStreamRef.current?.getVideoTracks().includes(displayTrack)) {
+            const hasOtherLiveTrack = screenStreamRef.current.getVideoTracks().some(
+              (t) => t !== displayTrack && t.readyState === "live"
+            );
+            if (!hasOtherLiveTrack) {
+              if (statusRef.current === "in-progress") {
+                handleScreenShareInterrupted();
+              } else {
+                setPreflightScreenStatus("not_shared");
+                setIsScreenInterrupted(false);
+              }
+            }
+          }
         };
       }
     } catch (err: any) {
@@ -514,6 +545,14 @@ export default function AIInterviewRoomPage() {
 
   // Screen share stopped mid-interview
   const handleScreenShareInterrupted = useCallback(() => {
+    // Only interrupt if no active live video track exists
+    const hasLiveTrack = screenStreamRef.current?.getVideoTracks().some((t) => t.readyState === "live");
+    if (hasLiveTrack) {
+      setIsScreenInterrupted(false);
+      setPreflightScreenStatus("entire_screen");
+      return;
+    }
+
     setIsScreenInterrupted(true);
     setPreflightScreenStatus("stopped");
     stopSpeaking();
@@ -522,7 +561,27 @@ export default function AIInterviewRoomPage() {
 
   // Resume screen sharing mid-interview
   const handleResumeScreenShare = async () => {
+    // 1. If screen stream is already live and valid, resolve immediately without prompting
+    const existingLiveTrack = screenStreamRef.current?.getVideoTracks().find((t) => t.readyState === "live");
+    if (existingLiveTrack && screenStreamRef.current) {
+      const check = verifyEntireScreenShare(screenStreamRef.current);
+      if (check.isValid) {
+        setIsScreenInterrupted(false);
+        setPreflightScreenStatus("entire_screen");
+        return;
+      }
+    }
+
     try {
+      // 2. Clean up previous screen tracks cleanly before asking user
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
+        screenStreamRef.current = null;
+      }
+
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { displaySurface: "monitor" } as any,
         audio: false,
@@ -530,7 +589,10 @@ export default function AIInterviewRoomPage() {
 
       const check = verifyEntireScreenShare(stream);
       if (!check.isValid) {
-        stream.getTracks().forEach((t) => t.stop());
+        stream.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
         toast({
           title: "Entire Screen Required",
           description: check.message || "Please select your ENTIRE SCREEN.",
@@ -540,6 +602,7 @@ export default function AIInterviewRoomPage() {
         return;
       }
 
+      screenStreamRef.current = stream;
       setScreenStream(stream);
       setPreflightScreenStatus("entire_screen");
       setIsScreenInterrupted(false);
@@ -548,7 +611,19 @@ export default function AIInterviewRoomPage() {
       const displayTrack = stream.getVideoTracks()[0];
       if (displayTrack) {
         displayTrack.onended = () => {
-          handleScreenShareInterrupted();
+          if (screenStreamRef.current?.getVideoTracks().includes(displayTrack)) {
+            const hasOtherLiveTrack = screenStreamRef.current.getVideoTracks().some(
+              (t) => t !== displayTrack && t.readyState === "live"
+            );
+            if (!hasOtherLiveTrack) {
+              if (statusRef.current === "in-progress") {
+                handleScreenShareInterrupted();
+              } else {
+                setPreflightScreenStatus("not_shared");
+                setIsScreenInterrupted(false);
+              }
+            }
+          }
         };
       }
     } catch (err: any) {
@@ -560,6 +635,20 @@ export default function AIInterviewRoomPage() {
       });
     }
   };
+
+  // Auto-dismiss screen interruption modal if live entire-screen track is verified
+  useEffect(() => {
+    if (isScreenInterrupted) {
+      const activeTrack = screenStreamRef.current?.getVideoTracks().find((t) => t.readyState === "live");
+      if (activeTrack && screenStreamRef.current) {
+        const check = verifyEntireScreenShare(screenStreamRef.current);
+        if (check.isValid) {
+          setIsScreenInterrupted(false);
+          setPreflightScreenStatus("entire_screen");
+        }
+      }
+    }
+  }, [isScreenInterrupted, screenStream]);
 
   // Part 11: Periodic reminder to share entire screen during preflight
   // Only use browser TTS fallback in standard mode; in realtime mode Bhashini handles this.
@@ -578,6 +667,33 @@ export default function AIInterviewRoomPage() {
   }, [status, preflightScreenStatus, ttsIsSpeaking, speak, voiceMode]);
   // Start interview with greeting and server timestamp initialization
   const startInterview = useCallback(async () => {
+    // 1. Ensure screen sharing is active and verified before starting
+    const activeScreenTrack = screenStreamRef.current?.getVideoTracks().find((t) => t.readyState === "live");
+    if (!activeScreenTrack || !screenStreamRef.current) {
+      setPreflightScreenStatus("not_shared");
+      setPreflightScreenError("Screen sharing is not active. Please share your entire screen to proceed.");
+      toast({
+        title: "Entire Screen Required",
+        description: "Please share your entire screen before starting the interview.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const check = verifyEntireScreenShare(screenStreamRef.current);
+    if (!check.isValid) {
+      setPreflightScreenStatus("wrong_surface");
+      setPreflightScreenError(check.message || "Please select your ENTIRE SCREEN.");
+      toast({
+        title: "Entire Screen Required",
+        description: check.message || "Please share your ENTIRE SCREEN, not a window or tab.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // 2. Guarantee interruption modal is dismissed when starting
+    setIsScreenInterrupted(false);
     setStatus("in-progress");
     setIsLoading(true);
 
@@ -1902,7 +2018,7 @@ export default function AIInterviewRoomPage() {
       </div>
 
       {/* Blocking Screen Share Interruption Modal (Part 13 & 14) */}
-      <AlertDialog open={isScreenInterrupted}>
+      <AlertDialog open={isScreenInterrupted && status === "in-progress"}>
         <AlertDialogContent className="border-destructive/40 max-w-md">
           <AlertDialogHeader>
             <div className="h-12 w-12 rounded-full bg-destructive/10 flex items-center justify-center mx-auto mb-2 text-destructive">
@@ -1910,7 +2026,7 @@ export default function AIInterviewRoomPage() {
             </div>
             <AlertDialogTitle className="text-center text-lg">Screen Sharing Stopped</AlertDialogTitle>
             <AlertDialogDescription className="text-center">
-              Screen sharing has stopped. To maintain interview integrity, please share your <strong>ENTIRE SCREEN</strong> again to resume. Sharing an individual window or tab is not permitted.
+              Screen sharing has stopped or was not detected. To maintain interview integrity, please share your <strong>ENTIRE SCREEN</strong> again to resume. Sharing an individual window or tab is not permitted.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="sm:justify-center">
