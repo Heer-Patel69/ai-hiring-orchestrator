@@ -65,6 +65,7 @@ import { submitRoundResult } from "@/lib/round-submission";
 import { resolveCandidateIdentity } from "@/lib/candidate-utils";
 import { checkFrameLuminance, verifyEntireScreenShare } from "@/lib/preflight-checker";
 import { backendAuthHeaders, backendUrl } from "@/lib/backend-api";
+import { askGroq, getGroqApiKey, getGroqModel } from "@/lib/groq-service";
 
 type InterviewStatus = "preparing" | "in-progress" | "completing" | "completed";
 type InterviewType = "technical" | "system-design" | "behavioral";
@@ -84,17 +85,42 @@ export default function AIInterviewRoomPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { toast } = useToast();
-  // voiceMode declared FIRST so TTS guard callbacks can reference it
-  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("realtime"); // Default to Bhashini realtime voice
-  const { speak: _browserSpeak, stop: _browserStopSpeaking, isSpeaking: ttsIsSpeaking } = useTextToSpeech();
-  // When Bhashini (realtime) is active, suppress browser SpeechSynthesis to prevent dual-voice conflict
+  // Voice mode and live word-by-word speech tracking
+  const [voiceMode, setVoiceMode] = useState<"standard" | "realtime">("standard");
+  const [activeSpeakingWords, setActiveSpeakingWords] = useState<string[]>([]);
+  const [activeSpeakingWordIndex, setActiveSpeakingWordIndex] = useState<number>(-1);
+
+  const {
+    speak: _browserSpeak,
+    stop: _browserStopSpeaking,
+    isSpeaking: ttsIsSpeaking,
+  } = useTextToSpeech({
+    onWordBoundary: (wordIndex) => {
+      setActiveSpeakingWordIndex(wordIndex);
+    },
+    onEnd: () => {
+      setActiveSpeakingWordIndex(-1);
+      setAiSpeaking(false);
+    },
+  });
+
+  // Master speech dispatcher: speaks voice and animates words word-by-word
   const speak = useCallback((text: string) => {
-    if (voiceMode !== "realtime") _browserSpeak(text);
-  }, [voiceMode, _browserSpeak]);
+    if (!text) return;
+    const splitWords = text.trim().split(/\s+/).filter(Boolean);
+    setActiveSpeakingWords(splitWords);
+    setActiveSpeakingWordIndex(0);
+    setAiSpeaking(true);
+    _browserSpeak(text, (idx) => {
+      setActiveSpeakingWordIndex(idx);
+    });
+  }, [_browserSpeak]);
+
   const stopSpeaking = useCallback(() => {
-    if (voiceMode !== "realtime") _browserStopSpeaking();
-    else window.speechSynthesis?.cancel(); // always cancel browser synth as safety net
-  }, [voiceMode, _browserStopSpeaking]);
+    _browserStopSpeaking();
+    setActiveSpeakingWordIndex(-1);
+    setAiSpeaking(false);
+  }, [_browserStopSpeaking]);
 
   // Interview state
   const [status, setStatus] = useState<InterviewStatus>("preparing");
@@ -824,6 +850,41 @@ export default function AIInterviewRoomPage() {
       }
     }
 
+    // Direct Groq LLM API call for immediate dashboard metrics & ultra-low latency
+    const groqKey = getGroqApiKey();
+    if (groqKey) {
+      try {
+        const systemPrompt = `You are Alex, an expert, professional, and empathetic AI technical interviewer conducting a live video interview.
+Role: ${jobContext?.jobTitle || "the position"}
+Field: ${jobContext?.jobField || "General"}
+Candidate Name: ${jobContext?.candidateName || "Candidate"}
+Current Question Number: ${questionCount + 1}
+Toughness Level: ${toughnessMap[jobContext?.toughnessLevel || 3] || "medium"}
+
+Rules:
+- Speak directly to the candidate in a professional, natural, conversational tone.
+- Keep responses concise (2 to 3 sentences maximum) so speech is clean and easy to follow.
+- Ask one clear question or follow-up at a time.
+- If this is the start of the interview, greet the candidate warmly, introduce yourself, and ask your opening question.`;
+
+        const groqMessages = [
+          { role: "system" as const, content: systemPrompt },
+          ...conversationMessages.map((m) => ({
+            role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
+            content: m.content,
+          })),
+        ];
+
+        const groqAnswer = await askGroq(groqMessages, { temperature: 0.6, maxTokens: 350 });
+        if (groqAnswer && groqAnswer.trim().length > 0) {
+          console.log("[Groq] Live response received from Groq API!");
+          return groqAnswer.trim();
+        }
+      } catch (groqErr) {
+        console.warn("[Groq] Direct Groq call failed, attempting backend fallback:", groqErr);
+      }
+    }
+
     try {
       const response = await fetch(
         backendUrl("/api/interview-agent"),
@@ -944,8 +1005,9 @@ export default function AIInterviewRoomPage() {
           };
           setMessages((prev) => [...prev, assistantMessage]);
           setQuestionCount((prev) => prev + 1);
+          setCurrentAiQuestion(response);
 
-          // Speak the response
+          // Speak the response with word-by-word synchronization
           if (isSpeaking) {
             speak(response);
             setAiSpeaking(true);
@@ -1668,6 +1730,7 @@ export default function AIInterviewRoomPage() {
                 onSendMessage={handleSendMessage}
                 aiSpeaking={aiSpeaking}
                 autoListen={true}
+                onCandidateSpeech={setCurrentCandidateSpeech}
                 className="flex-1"
               />
             )}
@@ -1957,20 +2020,84 @@ export default function AIInterviewRoomPage() {
                   </span>
                 )}
               </div>
-              {aiSpeaking && <span className="text-xs text-primary animate-pulse font-medium">Speaking question...</span>}
+              <div className="flex items-center gap-2">
+                {aiSpeaking ? (
+                  <span className="text-xs text-primary animate-pulse font-medium flex items-center gap-1">
+                    <Volume2 className="h-3.5 w-3.5 animate-bounce" />
+                    Speaking (Live Caption)
+                  </span>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 text-[11px] px-2 text-muted-foreground hover:text-foreground gap-1"
+                    onClick={() => speak(currentAiQuestion)}
+                    title="Play voice again"
+                  >
+                    <Volume2 className="h-3 w-3" />
+                    Listen
+                  </Button>
+                )}
+              </div>
             </div>
-            <p className="text-base font-medium leading-relaxed text-foreground">
-              "{currentAiQuestion}"
-            </p>
+
+            {/* Word-by-word Live Caption Highlight */}
+            <div className="text-base font-medium leading-relaxed text-foreground min-h-[4rem]">
+              {aiSpeaking && activeSpeakingWords.length > 0 ? (
+                activeSpeakingWords.map((word, idx) => {
+                  const isCurrent = idx === activeSpeakingWordIndex;
+                  const isSpoken = idx < activeSpeakingWordIndex;
+                  return (
+                    <span
+                      key={idx}
+                      className={cn(
+                        "inline-block mr-1.5 px-1 py-0.5 rounded transition-all duration-150",
+                        isCurrent && "bg-primary text-primary-foreground font-bold shadow-md scale-110 ring-2 ring-primary/40 -translate-y-0.5",
+                        isSpoken && "text-foreground font-medium",
+                        !isCurrent && !isSpoken && "text-muted-foreground/35"
+                      )}
+                    >
+                      {word}
+                    </span>
+                  );
+                })
+              ) : (
+                <p className="text-foreground">
+                  "{currentAiQuestion}"
+                </p>
+              )}
+            </div>
+
+            {/* Live Word Teleprompter Bar */}
+            {aiSpeaking && activeSpeakingWords.length > 0 && activeSpeakingWordIndex >= 0 && (
+              <div className="mt-3 pt-2.5 border-t border-border/40 flex items-center gap-2 text-xs">
+                <Badge variant="outline" className="text-[10px] uppercase font-mono px-1.5 py-0 text-primary border-primary/30">
+                  Live Word
+                </Badge>
+                <span className="font-semibold text-primary truncate">
+                  "{activeSpeakingWords[activeSpeakingWordIndex]}"
+                </span>
+                <span className="text-muted-foreground text-[11px] ml-auto">
+                  Word {activeSpeakingWordIndex + 1} of {activeSpeakingWords.length}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* CANDIDATE LIVE SPEECH TRANSCRIPTION DISPLAY */}
           {currentCandidateSpeech && (
             <div className="p-3.5 rounded-xl border border-success/30 bg-card/80 backdrop-blur-md shadow-sm">
-              <div className="flex items-center gap-2 mb-1.5">
-                <Badge className="bg-success/20 text-success border-success/30 uppercase tracking-wider text-xs font-semibold">
-                  You (Candidate)
-                </Badge>
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center gap-2">
+                  <Badge className="bg-success/20 text-success border-success/30 uppercase tracking-wider text-xs font-semibold">
+                    You (Candidate)
+                  </Badge>
+                  <span className="flex h-2 w-2 relative">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-success"></span>
+                  </span>
+                </div>
+                <span className="text-xs text-success font-medium">Listening...</span>
               </div>
               <p className="text-sm font-normal text-foreground/90 italic">
                 "{currentCandidateSpeech}"
@@ -2043,6 +2170,7 @@ export default function AIInterviewRoomPage() {
               onSendMessage={handleSendMessage}
               aiSpeaking={aiSpeaking}
               autoListen={true}
+              onCandidateSpeech={setCurrentCandidateSpeech}
               className="flex-1 min-h-0"
             />
           )}

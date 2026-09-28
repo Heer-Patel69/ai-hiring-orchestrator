@@ -146,9 +146,41 @@ export function BhashiniVoiceAgent({
           text: clean,
           language,
         });
-        if (data?.audioContent) queueRef.current?.enqueue(data.audioContent);
+        if (data?.audioContent) {
+          queueRef.current?.enqueue(data.audioContent);
+          return;
+        }
       } catch (e) {
-        console.error("Bhashini TTS failed:", e);
+        console.warn("Bhashini TTS unavailable, using browser speech synthesis fallback:", e);
+      }
+
+      // Guaranteed audible fallback via browser SpeechSynthesis
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+        const utterance = new SpeechSynthesisUtterance(clean);
+        utterance.rate = 0.95;
+        const voices = window.speechSynthesis.getVoices();
+        const voice = voices.find(
+          (v) => v.lang.startsWith("en-") && (v.name.includes("Google") || v.name.includes("Natural") || v.name.includes("Microsoft"))
+        ) || voices.find((v) => v.lang.startsWith("en-"));
+        if (voice) utterance.voice = voice;
+
+        utterance.onstart = () => {
+          setIsSpeaking(true);
+          onSpeakingChangeRef.current?.(true);
+        };
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          onSpeakingChangeRef.current?.(false);
+        };
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          onSpeakingChangeRef.current?.(false);
+        };
+        window.speechSynthesis.speak(utterance);
       }
     },
     [language]

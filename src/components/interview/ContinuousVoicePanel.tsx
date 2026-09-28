@@ -36,6 +36,7 @@ interface ContinuousVoicePanelProps {
   className?: string;
   autoListen?: boolean;
   aiSpeaking?: boolean;
+  onCandidateSpeech?: (text: string) => void;
 }
 
 export function ContinuousVoicePanel({
@@ -45,6 +46,7 @@ export function ContinuousVoicePanel({
   className,
   autoListen = true,
   aiSpeaking = false,
+  onCandidateSpeech,
 }: ContinuousVoicePanelProps) {
   const { toast } = useToast();
   const [inputValue, setInputValue] = useState("");
@@ -77,11 +79,15 @@ export function ContinuousVoicePanel({
     isLoadingRef.current = isLoading;
   }, [isLoading]);
 
-  // Store onSendMessage in ref to avoid dependency issues
   const onSendMessageRef = useRef(onSendMessage);
   useEffect(() => {
     onSendMessageRef.current = onSendMessage;
   }, [onSendMessage]);
+
+  const onCandidateSpeechRef = useRef(onCandidateSpeech);
+  useEffect(() => {
+    onCandidateSpeechRef.current = onCandidateSpeech;
+  }, [onCandidateSpeech]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -135,6 +141,7 @@ export function ContinuousVoicePanel({
 
       if (interim) {
         setInterimTranscript(interim);
+        onCandidateSpeechRef.current?.(interim);
         // Reset silence timeout on speech
         if (silenceTimeoutRef.current) {
           clearTimeout(silenceTimeoutRef.current);
@@ -144,6 +151,7 @@ export function ContinuousVoicePanel({
       if (final && final.trim()) {
         lastTranscriptRef.current = final.trim();
         setInterimTranscript("");
+        onCandidateSpeechRef.current?.(final.trim());
         
         // Wait for silence before sending
         if (silenceTimeoutRef.current) {

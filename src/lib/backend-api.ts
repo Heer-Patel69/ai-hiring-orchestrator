@@ -2,8 +2,7 @@ import { supabase } from "@/integrations/supabase/client";
 
 export function backendUrl(path: string): string {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim().replace(/\/$/, "");
-  const baseUrl = configured || (import.meta.env.DEV ? "http://localhost:10000" : "");
-  if (!baseUrl) throw new Error("VITE_API_BASE_URL is not configured");
+  const baseUrl = configured || "https://ai-hiring-orchestrator-1.onrender.com";
   return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
