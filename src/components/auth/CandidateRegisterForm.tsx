@@ -259,12 +259,28 @@ export function CandidateRegisterForm() {
 
       const userId = authData.user.id;
 
-      // 2. Upload resume first (fast operation)
+      // If Supabase has "Confirm email" turned on, no session is returned until email is verified
+      if (!authData.session) {
+        toast({
+          title: "Account created!",
+          description: "Please check your email to verify your account, then log in.",
+        });
+        navigate("/login");
+        return;
+      }
+
+      // 2. Upload resume (non-blocking if storage encounters an issue)
       const resumeExt = resumeFile.name.split(".").pop();
       const resumePath = `${userId}/resume.${resumeExt}`;
       
-      const resumeResult = await supabase.storage.from("resumes").upload(resumePath, resumeFile);
-      if (resumeResult.error) throw resumeResult.error;
+      try {
+        const resumeResult = await supabase.storage.from("resumes").upload(resumePath, resumeFile);
+        if (resumeResult.error) {
+          console.warn("Storage upload notice:", resumeResult.error.message);
+        }
+      } catch (storageErr) {
+        console.warn("Storage upload exception:", storageErr);
+      }
 
       // 3. Create user role FIRST (critical for login) with retry
       let roleCreated = false;

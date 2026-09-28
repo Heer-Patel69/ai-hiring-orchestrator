@@ -127,6 +127,15 @@ export function InterviewerRegisterForm() {
 
       const userId = authData.user.id;
 
+      if (!authData.session) {
+        toast({
+          title: "Registration successful!",
+          description: "Please check your email to verify your account, then log in.",
+        });
+        navigate("/login");
+        return;
+      }
+
       // 2. Create user role
       const { error: roleError } = await supabase
         .from("user_roles")
@@ -151,17 +160,20 @@ export function InterviewerRegisterForm() {
         const fileExt = logoFile.name.split(".").pop();
         const filePath = `${userId}/logo.${fileExt}`;
         
-        const { error: uploadError } = await supabase.storage
-          .from("company-logos")
-          .upload(filePath, logoFile);
+        try {
+          const { error: uploadError } = await supabase.storage
+            .from("company-logos")
+            .upload(filePath, logoFile);
 
-        if (uploadError) throw uploadError;
-
-        const { data: urlData } = supabase.storage
-          .from("company-logos")
-          .getPublicUrl(filePath);
-        
-        logoUrl = urlData.publicUrl;
+          if (!uploadError) {
+            const { data: urlData } = supabase.storage
+              .from("company-logos")
+              .getPublicUrl(filePath);
+            logoUrl = urlData.publicUrl;
+          }
+        } catch (uploadErr) {
+          console.warn("Logo upload notice:", uploadErr);
+        }
       }
 
       // 5. Create interviewer profile
