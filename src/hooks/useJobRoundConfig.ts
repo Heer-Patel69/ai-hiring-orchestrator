@@ -9,6 +9,7 @@ export interface RoundConfig {
   duration_minutes: number;
   custom_questions: string[] | null;
   ai_generate_questions: boolean;
+  passing_score?: number;
 }
 
 export interface JobConfig {

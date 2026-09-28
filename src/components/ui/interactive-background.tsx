@@ -222,6 +222,11 @@ export const InteractiveBackground = memo(function InteractiveBackground({
     };
   }, [enableParticles, particleCount, isVisible]);
 
+  const gradientLeft = useTransform(gradientX, (value) => `${value}%`);
+  const gradientTop = useTransform(gradientY, (value) => `${value}%`);
+  const secondaryOrbLeft = useTransform(orb2X, (value) => `${value}%`);
+  const secondaryOrbTop = useTransform(orb2Y, (value) => `${value}%`);
+
   return (
     <div
       ref={containerRef}
@@ -241,8 +246,8 @@ export const InteractiveBackground = memo(function InteractiveBackground({
           <motion.div
             className="absolute w-[800px] h-[800px] rounded-full will-change-transform"
             style={{
-              left: useTransform(gradientX, (v) => `${v}%`),
-              top: useTransform(gradientY, (v) => `${v}%`),
+              left: gradientLeft,
+              top: gradientTop,
               x: "-50%", y: "-50%",
               background: "radial-gradient(circle, hsla(243, 75%, 59%, 0.08) 0%, hsla(263, 70%, 55%, 0.03) 40%, transparent 70%)",
               filter: "blur(70px)",
@@ -251,8 +256,8 @@ export const InteractiveBackground = memo(function InteractiveBackground({
           <motion.div
             className="absolute w-[500px] h-[500px] rounded-full will-change-transform"
             style={{
-              left: useTransform(orb2X, (v) => `${v}%`),
-              top: useTransform(orb2Y, (v) => `${v}%`),
+              left: secondaryOrbLeft,
+              top: secondaryOrbTop,
               x: "-50%", y: "-50%",
               background: "radial-gradient(circle, hsla(160, 60%, 45%, 0.05) 0%, hsla(243, 75%, 59%, 0.03) 40%, transparent 70%)",
               filter: "blur(50px)",

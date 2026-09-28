@@ -64,6 +64,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { submitRoundResult } from "@/lib/round-submission";
 import { resolveCandidateIdentity } from "@/lib/candidate-utils";
 import { checkFrameLuminance, verifyEntireScreenShare } from "@/lib/preflight-checker";
+import { backendAuthHeaders, backendUrl } from "@/lib/backend-api";
 
 type InterviewStatus = "preparing" | "in-progress" | "completing" | "completed";
 type InterviewType = "technical" | "system-design" | "behavioral";
@@ -171,6 +172,7 @@ export default function AIInterviewRoomPage() {
   const [roundPassingScore, setRoundPassingScore] = useState(60);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const expiresAtRef = useRef<Date | null>(null);
+  const handleEndInterviewRef = useRef<() => Promise<void>>(async () => undefined);
 
   // Dialog state
   const [showExitDialog, setShowExitDialog] = useState(false);
@@ -290,15 +292,12 @@ export default function AIInterviewRoomPage() {
           const currentRoundIdx = application.current_round || 0;
           const { data: round } = await supabase
             .from("job_rounds")
-            .select("duration_minutes, passing_score")
+            .select("duration_minutes")
             .eq("job_id", job.id)
             .eq("round_number", currentRoundIdx + 1)
             .maybeSingle();
 
           const configuredDuration = round?.duration_minutes ? round.duration_minutes * 60 : DEFAULT_INTERVIEW_DURATION;
-          if (round?.passing_score) {
-            setRoundPassingScore(round.passing_score);
-          }
 
           // Server-enforced countdown timer: Calculate from database timestamps
           if (application.started_at && application.expires_at) {
@@ -316,7 +315,7 @@ export default function AIInterviewRoomPage() {
               setStatus("in-progress");
             } else if (remaining <= 0 && application.status === "interviewing") {
               // Expired while candidate was away, finalize gracefully
-              void handleEndInterview();
+              void handleEndInterviewRef.current();
             }
           } else {
             setInterviewDuration(configuredDuration);
@@ -357,14 +356,14 @@ export default function AIInterviewRoomPage() {
           setElapsedTime((prev) => prev + 1);
           if (remaining <= 0) {
             if (timerRef.current) clearInterval(timerRef.current);
-            void handleEndInterview();
+            void handleEndInterviewRef.current();
           }
         } else {
           setElapsedTime((prev) => prev + 1);
           setRemainingTime((prev) => {
             if (prev <= 1) {
               if (timerRef.current) clearInterval(timerRef.current);
-              void handleEndInterview();
+              void handleEndInterviewRef.current();
               return 0;
             }
             return prev - 1;
@@ -378,7 +377,7 @@ export default function AIInterviewRoomPage() {
         clearInterval(timerRef.current);
       }
     };
-  }, [status, handleEndInterview]);
+  }, [status]);
 
   // Fullscreen handling - now uses anti-cheat system
   const toggleFullscreen = useCallback(() => {
@@ -465,10 +464,10 @@ export default function AIInterviewRoomPage() {
     const interval = setInterval(() => {
       if (preflightVideoRef.current && preflightVideoRef.current.videoWidth > 0) {
         const lumResult = checkFrameLuminance(preflightVideoRef.current);
-        setPreflightCameraBrightness(Math.round(lumResult.luminance));
-        if (!lumResult.passed) {
+        setPreflightCameraBrightness(Math.round(lumResult.averageLuminance));
+        if (lumResult.isDark) {
           setPreflightCameraStatus("too_dark");
-          proctoringLogger.logProctoringEvent("camera_too_dark", "medium", `Camera image too dark: ${lumResult.luminance.toFixed(1)}%`);
+          proctoringLogger.logProctoringEvent("camera_too_dark", "medium", `Camera image too dark: ${lumResult.averageLuminance.toFixed(1)}`);
         } else {
           setPreflightCameraStatus("ready");
         }
@@ -487,11 +486,11 @@ export default function AIInterviewRoomPage() {
       });
 
       const check = verifyEntireScreenShare(stream);
-      if (!check.valid) {
+      if (!check.isValid) {
         stream.getTracks().forEach((t) => t.stop());
         setPreflightScreenStatus("wrong_surface");
-        setPreflightScreenError(check.reason || "Please select your ENTIRE SCREEN.");
-        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.reason || "Non-monitor surface selected");
+        setPreflightScreenError(check.message || "Please select your ENTIRE SCREEN.");
+        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.message || "Non-monitor surface selected");
         return;
       }
 
@@ -530,14 +529,14 @@ export default function AIInterviewRoomPage() {
       });
 
       const check = verifyEntireScreenShare(stream);
-      if (!check.valid) {
+      if (!check.isValid) {
         stream.getTracks().forEach((t) => t.stop());
         toast({
           title: "Entire Screen Required",
-          description: check.reason || "Please select your ENTIRE SCREEN.",
+          description: check.message || "Please select your ENTIRE SCREEN.",
           variant: "destructive",
         });
-        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.reason || "Non-monitor surface selected on resume");
+        proctoringLogger.logProctoringEvent("screen_share_wrong_surface", "medium", check.message || "Non-monitor surface selected on resume");
         return;
       }
 
@@ -661,17 +660,18 @@ export default function AIInterviewRoomPage() {
       5: "hard",
     };
     
+    if (!applicationId) {
+      throw new Error("An application is required to start an interview");
+    }
+
     const response = await fetch(
-      `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/interview-agent`,
+      backendUrl("/api/interview-agent"),
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-        },
+        headers: await backendAuthHeaders(),
         body: JSON.stringify({
           messages: conversationMessages,
-          applicationId: applicationId || undefined,
+          applicationId,
           jobField: jobContext?.jobField || (interviewType === "technical" ? "Data Structures and Algorithms" : 
                    interviewType === "system-design" ? "System Design" : "Behavioral"),
           toughnessLevel: toughnessMap[jobContext?.toughnessLevel || 3] || "medium",
@@ -686,7 +686,8 @@ export default function AIInterviewRoomPage() {
     );
 
     if (!response.ok) {
-      throw new Error("Failed to get response from AI");
+      const errPayload = await response.json().catch(() => null);
+      throw new Error(errPayload?.error?.message || `Failed to get response from AI (${response.status})`);
     }
 
     // Handle streaming response
@@ -962,6 +963,10 @@ export default function AIInterviewRoomPage() {
     proctoringLogger,
     proctoringEvents.length,
   ]);
+
+  useEffect(() => {
+    handleEndInterviewRef.current = handleEndInterview;
+  }, [handleEndInterview]);
 
   // Toggle listening
   const toggleListening = useCallback(() => {

@@ -4,8 +4,8 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import { backendAuthHeaders, backendUrl, invokeBackend } from "@/lib/backend-api";
 import {
   AudioQueue,
   blobToBase64,
@@ -141,10 +141,11 @@ export function BhashiniVoiceAgent({
       const clean = sanitizeForSpeech(text);
       if (!clean) return;
       try {
-        const { data, error } = await supabase.functions.invoke("bhashini-voice", {
-          body: { action: "tts", text: clean, language },
+        const data = await invokeBackend<{ audioContent?: string }>("/api/bhashini-voice", {
+          action: "tts",
+          text: clean,
+          language,
         });
-        if (error) throw error;
         if (data?.audioContent) queueRef.current?.enqueue(data.audioContent);
       } catch (e) {
         console.error("Bhashini TTS failed:", e);
@@ -164,14 +165,9 @@ export function BhashiniVoiceAgent({
       const pending: Promise<void>[] = [];
 
       try {
-        const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/interview-agent`;
-        const res = await fetch(url, {
+        const res = await fetch(backendUrl("/api/interview-agent"), {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-          },
+          headers: await backendAuthHeaders(),
           body: JSON.stringify({
             messages: historyRef.current,
             jobField,
@@ -262,10 +258,12 @@ export function BhashiniVoiceAgent({
         const wav = encodeWav(pcm16k, 16000);
         const audioContent = await blobToBase64(wav);
 
-        const { data, error } = await supabase.functions.invoke("bhashini-voice", {
-          body: { action: "asr", audioContent, language, samplingRate: 16000 },
+        const data = await invokeBackend<{ transcript?: string }>("/api/bhashini-voice", {
+          action: "asr",
+          audioContent,
+          language,
+          samplingRate: 16000,
         });
-        if (error) throw error;
 
         const transcript = (data?.transcript ?? "").trim();
         if (transcript.length < 2) return;

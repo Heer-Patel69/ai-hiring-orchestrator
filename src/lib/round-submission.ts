@@ -218,7 +218,7 @@ export async function submitRoundResult(params: SubmitRoundParams): Promise<Subm
     const commScore = detailedScores.communication ?? score;
     const psScore = detailedScores.problemSolving ?? score;
 
-    const recommendation = !passed
+    const recommendation: "shortlist" | "maybe" | "reject" = !passed
       ? "reject"
       : score >= 80
       ? "shortlist"

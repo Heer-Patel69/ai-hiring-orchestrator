@@ -335,23 +335,30 @@ export default function InterviewerCandidateReportPage() {
         hasData = true;
         const lastAgent = agentResults[agentResults.length - 1];
         const overallScore = application.overall_score || lastAgent.score || 0;
-        const rawData = lastAgent.raw_data || {};
+        const rawData = (lastAgent.raw_data && typeof lastAgent.raw_data === "object" && !Array.isArray(lastAgent.raw_data)
+          ? lastAgent.raw_data
+          : {}) as Record<string, unknown>;
+        const detailedScores = (lastAgent.detailed_scores && typeof lastAgent.detailed_scores === "object" && !Array.isArray(lastAgent.detailed_scores)
+          ? lastAgent.detailed_scores
+          : {}) as Record<string, unknown>;
+        const numberValue = (value: unknown, fallback: number) => typeof value === "number" ? value : fallback;
+        const stringList = (value: unknown, fallback: string[]) => Array.isArray(value) && value.every((item) => typeof item === "string") ? value : fallback;
         
         setCandidateScore({
           id: lastAgent.id || application.id,
           final_score: overallScore,
           percentile_rank: 75,
-          technical_score: rawData.technical_score || lastAgent.detailed_scores?.technical || overallScore,
-          communication_score: rawData.communication_score || lastAgent.detailed_scores?.communication || overallScore,
-          problem_solving_score: rawData.problem_solving_score || lastAgent.detailed_scores?.problem_solving || overallScore,
+          technical_score: numberValue(rawData.technical_score, numberValue(detailedScores.technical, overallScore)),
+          communication_score: numberValue(rawData.communication_score, numberValue(detailedScores.communication, overallScore)),
+          problem_solving_score: numberValue(rawData.problem_solving_score, numberValue(detailedScores.problem_solving, overallScore)),
           recommendation: lastAgent.decision === "pass" ? "shortlist" : lastAgent.decision === "reject" ? "reject" : "maybe",
           recommendation_reason: lastAgent.reasoning || `Evaluation completed with score ${overallScore}%`,
           recommendation_confidence: 0.88,
           overall_summary: lastAgent.reasoning || "Assessment evaluated by AI system.",
-          strengths: rawData.strengths || ["Solid technical fundamentals", "Clear communication"],
-          weaknesses: rawData.weaknesses || ["Could elaborate more on edge case handling"],
+          strengths: stringList(rawData.strengths, ["Solid technical fundamentals", "Clear communication"]),
+          weaknesses: stringList(rawData.weaknesses, ["Could elaborate more on edge case handling"]),
           improvement_suggestions: ["Deepen practical system architecture knowledge"],
-          risk_flags: rawData.fraud_flags || null,
+          risk_flags: stringList(rawData.fraud_flags, []),
           risk_explanations: null,
           rank_among_applicants: 1,
           total_applicants: 1,

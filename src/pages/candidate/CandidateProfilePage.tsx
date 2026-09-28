@@ -98,7 +98,12 @@ export default function CandidateProfilePage() {
         .maybeSingle();
 
       setProfile(profileData);
-      setCandidateProfile(candidateData);
+      setCandidateProfile(candidateData ? {
+        ...candidateData,
+        education: Array.isArray(candidateData.education) ? candidateData.education : [],
+        projects: Array.isArray(candidateData.projects) ? candidateData.projects : [],
+        certifications: Array.isArray(candidateData.certifications) ? candidateData.certifications : [],
+      } : null);
 
       if (profileData?.full_name) {
         setFullName(profileData.full_name);

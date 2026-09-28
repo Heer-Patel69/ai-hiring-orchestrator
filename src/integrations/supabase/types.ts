@@ -151,15 +151,20 @@ export type Database = {
           ai_confidence: number | null
           applied_at: string
           candidate_id: string
+          completed_at: string | null
           current_agent: number | null
           current_round: number | null
+          duration_seconds: number | null
+          expires_at: string | null
           fraud_flags: Json | null
           fraud_risk_score: number | null
           id: string
+          interview_context_snapshot: Json | null
           job_id: string
           notes: string | null
           overall_score: number | null
           status: Database["public"]["Enums"]["application_status"] | null
+          started_at: string | null
           updated_at: string
         }
         Insert: {
@@ -167,15 +172,20 @@ export type Database = {
           ai_confidence?: number | null
           applied_at?: string
           candidate_id: string
+          completed_at?: string | null
           current_agent?: number | null
           current_round?: number | null
+          duration_seconds?: number | null
+          expires_at?: string | null
           fraud_flags?: Json | null
           fraud_risk_score?: number | null
           id?: string
+          interview_context_snapshot?: Json | null
           job_id: string
           notes?: string | null
           overall_score?: number | null
           status?: Database["public"]["Enums"]["application_status"] | null
+          started_at?: string | null
           updated_at?: string
         }
         Update: {
@@ -183,15 +193,20 @@ export type Database = {
           ai_confidence?: number | null
           applied_at?: string
           candidate_id?: string
+          completed_at?: string | null
           current_agent?: number | null
           current_round?: number | null
+          duration_seconds?: number | null
+          expires_at?: string | null
           fraud_flags?: Json | null
           fraud_risk_score?: number | null
           id?: string
+          interview_context_snapshot?: Json | null
           job_id?: string
           notes?: string | null
           overall_score?: number | null
           status?: Database["public"]["Enums"]["application_status"] | null
+          started_at?: string | null
           updated_at?: string
         }
         Relationships: [
@@ -289,7 +304,9 @@ export type Database = {
           certifications: Json | null
           created_at: string
           education: Json | null
+          email: string | null
           experience_years: number | null
+          full_name: string | null
           github_analysis: Json | null
           github_score: number | null
           github_url: string | null
@@ -298,19 +315,24 @@ export type Database = {
           linkedin_score: number | null
           linkedin_url: string | null
           live_photo_url: string | null
+          location: string | null
           phone_number: string
           profile_analyzed_at: string | null
           profile_score: number | null
           projects: Json | null
           resume_url: string | null
           skills: string[] | null
+          soft_skills: Json | null
+          summary: string | null
           suggested_job_preferences: Json | null
+          technical_skills: Json | null
           updated_at: string
           user_id: string
           verification_confidence: number | null
           verification_status:
             | Database["public"]["Enums"]["verification_status"]
             | null
+          work_experience: Json | null
         }
         Insert: {
           aadhaar_back_url?: string | null
@@ -319,7 +341,9 @@ export type Database = {
           certifications?: Json | null
           created_at?: string
           education?: Json | null
+          email?: string | null
           experience_years?: number | null
+          full_name?: string | null
           github_analysis?: Json | null
           github_score?: number | null
           github_url?: string | null
@@ -328,19 +352,24 @@ export type Database = {
           linkedin_score?: number | null
           linkedin_url?: string | null
           live_photo_url?: string | null
+          location?: string | null
           phone_number: string
           profile_analyzed_at?: string | null
           profile_score?: number | null
           projects?: Json | null
           resume_url?: string | null
           skills?: string[] | null
+          soft_skills?: Json | null
+          summary?: string | null
           suggested_job_preferences?: Json | null
+          technical_skills?: Json | null
           updated_at?: string
           user_id: string
           verification_confidence?: number | null
           verification_status?:
             | Database["public"]["Enums"]["verification_status"]
             | null
+          work_experience?: Json | null
         }
         Update: {
           aadhaar_back_url?: string | null
@@ -349,7 +378,9 @@ export type Database = {
           certifications?: Json | null
           created_at?: string
           education?: Json | null
+          email?: string | null
           experience_years?: number | null
+          full_name?: string | null
           github_analysis?: Json | null
           github_score?: number | null
           github_url?: string | null
@@ -358,21 +389,132 @@ export type Database = {
           linkedin_score?: number | null
           linkedin_url?: string | null
           live_photo_url?: string | null
+          location?: string | null
           phone_number?: string
           profile_analyzed_at?: string | null
           profile_score?: number | null
           projects?: Json | null
           resume_url?: string | null
           skills?: string[] | null
+          soft_skills?: Json | null
+          summary?: string | null
           suggested_job_preferences?: Json | null
+          technical_skills?: Json | null
           updated_at?: string
           user_id?: string
           verification_confidence?: number | null
           verification_status?:
             | Database["public"]["Enums"]["verification_status"]
             | null
+          work_experience?: Json | null
         }
         Relationships: []
+      }
+      candidate_round_attempts: {
+        Row: {
+          ai_feedback: string | null
+          ai_summary: string | null
+          application_id: string
+          candidate_id: string
+          communication_score: number | null
+          completed_at: string | null
+          created_at: string
+          id: string
+          job_id: string
+          problem_solving_score: number | null
+          recording_url: string | null
+          round_id: string | null
+          round_number: number
+          score: number | null
+          started_at: string | null
+          status: string
+          strengths: string[] | null
+          submitted_at: string | null
+          technical_score: number | null
+          termination_reason_code: string | null
+          termination_reason_text: string | null
+          termination_type: string | null
+          transcript_snapshot: Json | null
+          updated_at: string
+          weaknesses: string[] | null
+        }
+        Insert: {
+          ai_feedback?: string | null
+          ai_summary?: string | null
+          application_id: string
+          candidate_id: string
+          communication_score?: number | null
+          completed_at?: string | null
+          created_at?: string
+          id?: string
+          job_id: string
+          problem_solving_score?: number | null
+          recording_url?: string | null
+          round_id?: string | null
+          round_number: number
+          score?: number | null
+          started_at?: string | null
+          status?: string
+          strengths?: string[] | null
+          submitted_at?: string | null
+          technical_score?: number | null
+          termination_reason_code?: string | null
+          termination_reason_text?: string | null
+          termination_type?: string | null
+          transcript_snapshot?: Json | null
+          updated_at?: string
+          weaknesses?: string[] | null
+        }
+        Update: {
+          ai_feedback?: string | null
+          ai_summary?: string | null
+          application_id?: string
+          candidate_id?: string
+          communication_score?: number | null
+          completed_at?: string | null
+          created_at?: string
+          id?: string
+          job_id?: string
+          problem_solving_score?: number | null
+          recording_url?: string | null
+          round_id?: string | null
+          round_number?: number
+          score?: number | null
+          started_at?: string | null
+          status?: string
+          strengths?: string[] | null
+          submitted_at?: string | null
+          technical_score?: number | null
+          termination_reason_code?: string | null
+          termination_reason_text?: string | null
+          termination_type?: string | null
+          transcript_snapshot?: Json | null
+          updated_at?: string
+          weaknesses?: string[] | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "candidate_round_attempts_application_id_fkey"
+            columns: ["application_id"]
+            isOneToOne: false
+            referencedRelation: "applications"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "candidate_round_attempts_job_id_fkey"
+            columns: ["job_id"]
+            isOneToOne: false
+            referencedRelation: "jobs"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "candidate_round_attempts_round_id_fkey"
+            columns: ["round_id"]
+            isOneToOne: false
+            referencedRelation: "job_rounds"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       candidate_rankings: {
         Row: {
@@ -989,14 +1131,19 @@ export type Database = {
           application_id: string
           archived_at: string | null
           audio_url: string | null
+          candidate_id: string | null
           code_submissions: Json | null
           created_at: string
           downloaded_at: string | null
           downloaded_by: string | null
           duration_minutes: number | null
+          ended_at: string | null
           fraud_flags: Json | null
           id: string
           interviewer_id: string | null
+          recording_chunks: Json | null
+          recording_url: string | null
+          started_at: string | null
           status: string | null
           transcript: Json | null
           video_url: string | null
@@ -1007,14 +1154,19 @@ export type Database = {
           application_id: string
           archived_at?: string | null
           audio_url?: string | null
+          candidate_id?: string | null
           code_submissions?: Json | null
           created_at?: string
           downloaded_at?: string | null
           downloaded_by?: string | null
           duration_minutes?: number | null
+          ended_at?: string | null
           fraud_flags?: Json | null
           id?: string
           interviewer_id?: string | null
+          recording_chunks?: Json | null
+          recording_url?: string | null
+          started_at?: string | null
           status?: string | null
           transcript?: Json | null
           video_url?: string | null
@@ -1025,14 +1177,19 @@ export type Database = {
           application_id?: string
           archived_at?: string | null
           audio_url?: string | null
+          candidate_id?: string | null
           code_submissions?: Json | null
           created_at?: string
           downloaded_at?: string | null
           downloaded_by?: string | null
           duration_minutes?: number | null
+          ended_at?: string | null
           fraud_flags?: Json | null
           id?: string
           interviewer_id?: string | null
+          recording_chunks?: Json | null
+          recording_url?: string | null
+          started_at?: string | null
           status?: string | null
           transcript?: Json | null
           video_url?: string | null
@@ -1990,8 +2147,10 @@ export type Database = {
       app_role: "interviewer" | "candidate"
       application_status:
         | "applied"
+        | "assessment_in_progress"
         | "screening"
         | "interviewing"
+        | "completed"
         | "shortlisted"
         | "rejected"
         | "hired"
@@ -2159,8 +2318,10 @@ export const Constants = {
       app_role: ["interviewer", "candidate"],
       application_status: [
         "applied",
+        "assessment_in_progress",
         "screening",
         "interviewing",
+        "completed",
         "shortlisted",
         "rejected",
         "hired",

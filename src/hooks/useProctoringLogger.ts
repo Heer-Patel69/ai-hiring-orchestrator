@@ -182,8 +182,17 @@ export function useProctoringLogger({
     });
   }, [logEvent]);
 
+  const logProctoringEvent = useCallback((
+    type: ProctoringEventType,
+    severity: "low" | "medium" | "high" | "critical",
+    description: string,
+  ) => {
+    logEvent({ type, severity, description, timestamp: new Date() });
+  }, [logEvent]);
+
   return {
     logEvent,
+    logProctoringEvent,
     logCameraActivity,
     startLogging,
     stopLogging,

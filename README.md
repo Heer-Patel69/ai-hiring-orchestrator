@@ -1,214 +1,118 @@
-Here is your **properly formatted professional README.md** ready to paste into GitHub. I have structured it according to modern SaaS / AI product documentation standards so it looks investor-grade, recruiter-grade, and enterprise-ready.
+# HireMinds AI
 
-You can copy it directly.
+HireMinds is a React/Vite hiring platform backed by Supabase Auth, PostgreSQL, Storage, and Edge Functions. Production interview streaming and Bhashini speech requests run through a Node.js API on Render.
 
----
+## Production architecture
 
-```markdown
-# HireMinds AI — Intelligent Hiring Infrastructure
-
-## Overview
-
-**HireMinds AI** is a modern hiring platform engineered to streamline recruitment through structured automation, intelligent evaluation workflows, and data-backed decision support.
-
-The platform enables organizations to manage the entire hiring lifecycle — from candidate onboarding and technical assessments to evaluation and analytics — within a secure and scalable environment.
-
-Built with reliability and performance in mind, HireMinds AI supports hiring teams that require speed without sacrificing oversight or fairness.
-
----
-
-## Core Capabilities
-
-| Capability | Description |
-|------------|--------------|
-| **Structured Interviews** | Conduct consistent and repeatable candidate evaluations |
-| **Integrated Code Editor** | Assess technical skills in a production-grade environment |
-| **Assessment Integrity** | Multi-layer verification designed to protect evaluation quality |
-| **Fairness Monitoring** | Visibility into hiring patterns to support responsible decision-making |
-| **Advanced Analytics** | Clear insights into pipeline performance and hiring outcomes |
-| **Continuous Improvement** | Systems designed to evolve through measurable feedback |
-
----
-
-## Platform Architecture
-
+```text
+Browser → Vercel (Vite SPA) → Render API
+                              ├─ Supabase Auth/Postgres/Storage
+                              ├─ Groq
+                              └─ Bhashini
 ```
 
-React Frontend
-↓
-Cloud Backend
-(Authentication, Database, Storage, Server Functions)
-↓
-Intelligence Layer
+The browser uses only the Supabase publishable key. Database credentials, Supabase secret keys, Groq keys, and Bhashini credentials are server-only.
 
-```
+## Local development
 
-The architecture follows a modular approach, allowing the platform to scale efficiently as organizational hiring needs expand.
+Requirements: Node.js 20.11 or later (Node.js 22 recommended) and npm.
 
-For deeper technical details, refer to:
+1. Copy `.env.example` to `.env` and replace placeholders locally. `.env` is gitignored.
+2. Install dependencies:
 
-```
+   ```bash
+   npm ci
+   npm --prefix server ci
+   ```
 
-/docs/ARCHITECTURE.md
+3. Start the Render-compatible backend:
 
-```
+   ```bash
+   npm run backend:dev
+   ```
 
----
+4. In another terminal, start the frontend:
 
-## Technology Stack
+   ```bash
+   npm run dev
+   ```
 
-### Frontend
-- React 18  
-- TypeScript  
-- Vite  
+The local frontend uses `http://localhost:10000` when `VITE_API_BASE_URL` is omitted.
 
-### User Interface
-- Tailwind CSS  
-- shadcn/ui  
-- Framer Motion  
-
-### State Management
-- TanStack Query  
-- React Context  
-
-### Backend
-- Supabase (Postgres, Authentication, Storage)
-
-### Developer Tooling
-- Monaco Editor for technical assessments  
-
----
-
-## Project Structure
-
-```
-
-src/
-├── components/
-│   ├── auth/          # Authentication flows
-│   ├── candidate/     # Candidate experience
-│   ├── dashboard/     # Recruiter workspace
-│   ├── interview/     # Interview environment
-│   ├── fairness/      # Monitoring tools
-│   └── ui/            # Shared UI components
-│
-├── contexts/          # Global state providers
-├── hooks/             # Custom React hooks
-├── pages/             # Application routes
-└── integrations/      # Backend clients
-
-supabase/
-├── functions/         # Server-side logic
-└── migrations/        # Database versioning
-
-docs/
-├── ARCHITECTURE.md
-└── ETHICAL_SAFEGUARDS.md
-
-````
-
----
-
-## Getting Started
-
-### Prerequisites
-- Node.js 18 or higher  
-- npm or yarn  
-
-### Installation
+## Verification commands
 
 ```bash
-git clone <YOUR_GIT_URL>
-cd <YOUR_PROJECT_NAME>
-
-npm install
-npm run dev
-````
-
----
-
-## Security and Data Protection
-
-Security is integrated across the platform architecture:
-
-* Verified authentication workflows
-* Role-based access control
-* Row-level database security
-* Encryption for sensitive data
-* Input validation and sanitization
-* Assessment monitoring safeguards
-
----
-
-## Responsible Intelligence
-
-HireMinds AI is designed to promote transparent and accountable hiring practices.
-
-**Principles include:**
-
-* Awareness and monitoring of potential bias
-* Interpretable evaluation signals
-* Human review capabilities
-* Privacy-first data handling
-
-Additional details are available in:
-
-```
-/docs/ETHICAL_SAFEGUARDS.md
+npm run lint
+npm run test
+npm run build
+npm run backend:test
 ```
 
----
+## Database migrations
 
-## Designed for Hiring Teams and Candidates
+Migrations live in `supabase/migrations`. Review and back up production data before applying schema changes, then use the current Supabase CLI:
 
-### Recruiters and Hiring Teams
-
-* Create and manage job postings
-* Track candidates across the hiring funnel
-* Review structured evaluation insights
-* Access analytics dashboards
-* Maintain final decision authority
-
-### Candidates
-
-* Secure registration and profile creation
-* Discover relevant opportunities
-* Complete structured assessments
-* Receive performance feedback
-* Monitor application status
-
----
-
-## Contributing
-
-Contributions that improve stability, usability, and performance are welcome.
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to your branch
-5. Open a Pull Request
-
----
-
-## License
-
-**Proprietary Software — All Rights Reserved**
-
-Unauthorized distribution or reproduction of this software is strictly prohibited.
-
+```bash
+npx supabase --help
+npx supabase db push
 ```
 
----
+Do not run destructive migrations automatically from an HTTP request or from the Render start command.
 
-If you want, I can next:
+## Render deployment
 
-• Make it look like a **Silicon Valley startup README**  
-• Optimize it to **impress hackathon judges / investors**  
-• Compress it into a **high-impact one-page README**  
-• Make it sound more **AI-heavy and futuristic**  
-• Add **badges, metrics, and credibility signals**  
-• Rewrite it so it looks like a **$10M startup repo**
+The repository includes `render.yaml`. Create a Render Blueprint from this repository; it builds from `server/`, runs `npm start`, binds to `0.0.0.0:$PORT`, and uses `/health` for liveness. `/ready` verifies PostgreSQL and required providers.
 
-Just tell me what style you want next.
+Set these values in the Render Dashboard when the Blueprint prompts for them:
+
+| Variable | Value source |
+|---|---|
+| `DATABASE_URL` | Supabase Dashboard → Connect → Session Pooler; append `sslmode=require` |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_PUBLISHABLE_KEY` | Supabase publishable key (`sb_publishable_...`) |
+| `SUPABASE_SECRET_KEY` | Supabase backend secret key (`sb_secret_...`) |
+| `GROQ_API_KEY_1` | Primary Groq API key |
+| `GROQ_API_KEY_2` | Secondary Groq API key |
+| `GROQ_API_KEY_3` | Tertiary Groq API key |
+| `BHASHINI_UDYAT_KEY` | Bhashini Udyat/user credential |
+| `BHASHINI_INFERENCE_KEY` | Bhashini inference/ULCA credential |
+| `FRONTEND_URL` | Exact production Vercel origin, without a trailing slash |
+| `CORS_ORIGINS` | Comma-separated exact allowed origins, without paths |
+
+`APP_ENV`, `DB_POOL_MAX`, `GROQ_MODEL`, `BHASHINI_PIPELINE_ID`, and `NODE_VERSION` are safe defaults in `render.yaml`. Render injects `PORT`; do not create it manually.
+
+After deployment, verify:
+
+```text
+GET https://YOUR-RENDER-SERVICE.onrender.com/health
+GET https://YOUR-RENDER-SERVICE.onrender.com/ready
 ```
+
+## Vercel deployment
+
+Import the repository as a Vite project. `vercel.json` uses `npm ci`, `npm run build`, the `dist` output directory, and an SPA refresh fallback.
+
+Set only these three variables for Production (and Preview only when the preview origin is also allowlisted on Render):
+
+| Variable | Value |
+|---|---|
+| `VITE_API_BASE_URL` | `https://YOUR-RENDER-SERVICE.onrender.com` |
+| `VITE_SUPABASE_URL` | `https://YOUR-PROJECT-REF.supabase.co` |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | Supabase publishable key |
+
+Never add `DATABASE_URL`, `SUPABASE_SECRET_KEY`, Groq keys, or Bhashini credentials to Vercel or to any `VITE_*` variable.
+
+## Supabase production settings
+
+- Add the exact Vercel production URL to Auth **Site URL** and **Redirect URLs**.
+- Add only intentional preview/custom domains to Redirect URLs.
+- Keep resume, identity document, and recording buckets private with RLS-backed access.
+- Deploy versioned migrations before testing production workflows.
+- Non-interview Edge Functions may still require provider secrets such as `RESEND_API_KEY`; set them in Supabase Edge Function Secrets, never in Vercel.
+
+## Security notes
+
+- The Render API validates the Supabase user access token and verifies application ownership before starting an interview request.
+- CORS is an exact origin allowlist; wildcard credentialed CORS is not enabled.
+- Logs include request IDs but do not include credential values.
+- Render local disk is not used for persistent files.
