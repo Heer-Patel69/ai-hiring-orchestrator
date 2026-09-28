@@ -27,6 +27,7 @@ interface ProctoringMonitorProps {
   candidateId?: string | null;
   recordingId?: string | null;
   enableCameraMonitoring?: boolean;
+  mediaStream?: MediaStream | null;
   className?: string;
 }
 
@@ -38,6 +39,7 @@ export function ProctoringMonitor({
   candidateId = null,
   recordingId = null,
   enableCameraMonitoring = true,
+  mediaStream = null,
   className,
 }: ProctoringMonitorProps) {
   const [trustScore, setTrustScore] = useState(100);
@@ -89,16 +91,23 @@ export function ProctoringMonitor({
 
     const setupCameraMonitoring = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: "user" },
-          audio: false,
-        });
+        let stream = mediaStream;
+        if (!stream) {
+          stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: "user" },
+            audio: false,
+          });
+        }
 
         // Create hidden video element for monitoring
         const video = document.createElement("video");
         video.srcObject = stream;
         video.autoplay = true;
         video.muted = true;
+        video.playsInline = true;
+        try {
+          await video.play();
+        } catch (_) {}
         videoRef.current = video;
 
         setCameraStatus("active");
@@ -111,65 +120,70 @@ export function ProctoringMonitor({
           description: "Camera active, monitoring started",
         });
 
-        // Simple brightness-based face detection (basic monitoring)
-        // For production, use face-api.js or similar
+        // Brightness-based camera obstruction & covered detection
         faceCheckIntervalRef.current = setInterval(() => {
-          if (videoRef.current && videoRef.current.readyState >= 2) {
-            // Check if video is playing (camera not blocked)
+          if (videoRef.current && (videoRef.current.readyState >= 2 || videoRef.current.videoWidth > 0)) {
             const canvas = document.createElement("canvas");
-            canvas.width = 100;
-            canvas.height = 100;
+            canvas.width = 64;
+            canvas.height = 48;
             const ctx = canvas.getContext("2d");
             if (ctx) {
-              ctx.drawImage(videoRef.current, 0, 0, 100, 100);
-              const imageData = ctx.getImageData(0, 0, 100, 100);
-              const data = imageData.data;
-              
-              // Calculate average brightness
-              let totalBrightness = 0;
-              for (let i = 0; i < data.length; i += 4) {
-                totalBrightness += (data[i] + data[i + 1] + data[i + 2]) / 3;
-              }
-              const avgBrightness = totalBrightness / (data.length / 4);
-              
-              // Very dark = camera likely blocked
-              if (avgBrightness < 10) {
-                if (faceDetected) {
-                  setFaceDetected(false);
-                  setCameraStatus("blocked");
-                  
-                  const event: ProctoringEvent = {
-                    type: "camera_blocked",
-                    timestamp: new Date(),
-                    severity: "high",
-                    description: "Camera appears to be blocked or covered",
-                  };
-                  logProctoringEvent(event);
-
-                  setTrustScore((prev) => {
-                    const newScore = Math.max(0, prev - 10);
-                    onTrustScoreChange?.(newScore);
-                    return newScore;
-                  });
-
-                  setWarningMessage("Camera blocked! Please ensure your face is visible.");
-                  setShowWarning(true);
-                  setTimeout(() => setShowWarning(false), 5000);
-                }
-              } else if (!faceDetected) {
-                setFaceDetected(true);
-                setCameraStatus("active");
+              try {
+                ctx.drawImage(videoRef.current, 0, 0, 64, 48);
+                const imageData = ctx.getImageData(0, 0, 64, 48);
+                const data = imageData.data;
                 
-                logProctoringEvent({
-                  type: "face_detected",
-                  timestamp: new Date(),
-                  severity: "low",
-                  description: "Face detected again",
-                });
-              }
+                // Calculate average brightness
+                let totalBrightness = 0;
+                for (let i = 0; i < data.length; i += 4) {
+                  totalBrightness += (data[i] + data[i + 1] + data[i + 2]) / 3;
+                }
+                const avgBrightness = totalBrightness / (data.length / 4);
+                
+                // Average brightness below 20 indicates camera is covered, blocked, or pitch black
+                if (avgBrightness < 20) {
+                  if (faceDetected) {
+                    setFaceDetected(false);
+                    setCameraStatus("blocked");
+                    
+                    const event: ProctoringEvent = {
+                      type: "camera_blocked",
+                      timestamp: new Date(),
+                      severity: "high",
+                      description: "Camera blocked or covered by hand/obstruction",
+                    };
+                    logProctoringEvent(event);
+
+                    setTrustScore((prev) => {
+                      const newScore = Math.max(0, prev - 15);
+                      onTrustScoreChange?.(newScore);
+                      return newScore;
+                    });
+
+                    setWarningMessage("Camera covered! Please keep camera unobstructed.");
+                    setShowWarning(true);
+                    toast({
+                      title: "Camera Blocked Detected",
+                      description: "Your camera is covered. Please uncover your camera to avoid trust score deductions.",
+                      variant: "destructive",
+                    });
+                    setTimeout(() => setShowWarning(false), 5000);
+                  }
+                } else if (!faceDetected && avgBrightness >= 25) {
+                  setFaceDetected(true);
+                  setCameraStatus("active");
+                  
+                  logProctoringEvent({
+                    type: "face_detected",
+                    timestamp: new Date(),
+                    severity: "low",
+                    description: "Camera feed unobstructed and active",
+                  });
+                }
+              } catch (_) {}
             }
           }
-        }, 2000); // Check every 2 seconds
+        }, 1500); // Check every 1.5 seconds
 
       } catch (error) {
         console.error("Camera access failed:", error);

@@ -100,8 +100,36 @@ export function InterviewRecordingViewer({
 
         if (recordingError) throw recordingError;
 
-        if (recordingData?.video_url) {
-          let playableUrl = recordingData.video_url;
+        let resolvedRecording = recordingData;
+        let effectiveVideoUrl = recordingData?.video_url || "";
+
+        // Check if there is a cached recording URL in session storage
+        if (!effectiveVideoUrl || effectiveVideoUrl.trim() === "") {
+          const cachedUrl = typeof window !== "undefined"
+            ? sessionStorage.getItem(`interview_recording_${applicationId}`)
+            : null;
+          if (cachedUrl) {
+            effectiveVideoUrl = cachedUrl;
+          }
+        }
+
+        if (!resolvedRecording && effectiveVideoUrl) {
+          resolvedRecording = {
+            id: `rec-${applicationId}`,
+            application_id: applicationId,
+            video_url: effectiveVideoUrl,
+            audio_url: null,
+            duration_minutes: 5,
+            status: "ready",
+            viewed_at: null,
+            viewed_by: null,
+            downloaded_at: null,
+            archived_at: null,
+          };
+        }
+
+        if (resolvedRecording && effectiveVideoUrl) {
+          let playableUrl = effectiveVideoUrl;
           if (!playableUrl.startsWith("blob:") && !playableUrl.startsWith("data:")) {
             let storagePath = playableUrl;
             if (storagePath.includes("/interview-recordings/")) {
@@ -118,14 +146,14 @@ export function InterviewRecordingViewer({
               console.warn("Could not create signed URL:", sErr);
             }
           }
-          recordingData.video_url = playableUrl;
+          resolvedRecording.video_url = playableUrl;
         }
 
-        setRecording(recordingData);
-        setHasViewed(!!recordingData?.viewed_at);
+        setRecording(resolvedRecording);
+        setHasViewed(!!resolvedRecording?.viewed_at);
 
         // Fetch proctoring logs
-        if (recordingData) {
+        if (resolvedRecording) {
           const { data: logs, error: logsError } = await supabase
             .from("proctoring_logs")
             .select("*")
@@ -372,18 +400,28 @@ export function InterviewRecordingViewer({
           </div>
         )}
 
-        <div className="relative bg-black aspect-video">
-          <video
-            ref={videoRef}
-            src={recording.video_url || undefined}
-            className="w-full h-full"
-            onTimeUpdate={handleTimeUpdate}
-            onLoadedMetadata={handleLoadedMetadata}
-            onPlay={() => setIsPlaying(true)}
-            onPause={() => setIsPlaying(false)}
-            onEnded={() => setIsPlaying(false)}
-            muted={isMuted}
-          />
+        <div className="relative bg-black aspect-video flex items-center justify-center">
+          {recording.video_url ? (
+            <video
+              ref={videoRef}
+              src={recording.video_url}
+              className="w-full h-full"
+              onTimeUpdate={handleTimeUpdate}
+              onLoadedMetadata={handleLoadedMetadata}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onEnded={() => setIsPlaying(false)}
+              muted={isMuted}
+            />
+          ) : (
+            <div className="text-center p-6 text-muted-foreground">
+              <Video className="h-10 w-10 mx-auto mb-2 text-primary/70 animate-pulse" />
+              <p className="text-sm font-medium text-foreground">Interview Video Stream Processing</p>
+              <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto">
+                Candidate audio signals, proctoring events, and Groq-evaluated transcripts are synchronized in the audit logs.
+              </p>
+            </div>
+          )}
 
           {/* Video Controls */}
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">

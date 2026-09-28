@@ -791,6 +791,9 @@ export default function AIInterviewRoomPage() {
           timestamp: new Date(),
         },
       ]);
+      setTranscriptLog([
+        { speaker: "ai", text: effectiveGreeting.trim(), timestamp: Date.now() },
+      ]);
       setQuestionCount(1);
       setCurrentAiQuestion(effectiveGreeting);
 
@@ -809,6 +812,9 @@ export default function AIInterviewRoomPage() {
           content: fallbackGreeting,
           timestamp: new Date(),
         },
+      ]);
+      setTranscriptLog([
+        { speaker: "ai", text: fallbackGreeting.trim(), timestamp: Date.now() },
       ]);
       setQuestionCount(1);
       setCurrentAiQuestion(fallbackGreeting);
@@ -987,6 +993,10 @@ Rules:
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMessage]);
+      setTranscriptLog((prev) => [
+        ...prev,
+        { speaker: "candidate", text: content.trim(), timestamp: Date.now() },
+      ]);
       setIsLoading(true);
       stopSpeaking();
 
@@ -1006,6 +1016,10 @@ Rules:
             timestamp: new Date(),
           };
           setMessages((prev) => [...prev, assistantMessage]);
+          setTranscriptLog((prev) => [
+            ...prev,
+            { speaker: "ai", text: response.trim(), timestamp: Date.now() },
+          ]);
           setQuestionCount((prev) => prev + 1);
           setCurrentAiQuestion(response);
 
@@ -1044,6 +1058,17 @@ Rules:
   // Handle proctoring events
   const handleProctoringEvent = useCallback((event: ProctoringEvent) => {
     setProctoringEvents((prev) => [...prev, event]);
+
+    // Apply covered camera penalty directly to anti-cheat trust score
+    if (event.type === "camera_blocked" || event.type === "face_not_visible") {
+      antiCheat.addEvent({
+        type: "camera_blocked",
+        timestamp: event.timestamp,
+        severity: "high",
+        description: event.description || "Camera covered or blocked by candidate",
+      });
+    }
+
     // Also log to database via proctoring logger
     if (applicationId && candidateId) {
       // Map local event type to valid proctoring log event type
@@ -1064,7 +1089,7 @@ Rules:
         severity: event.severity,
       });
     }
-  }, [applicationId, candidateId, proctoringLogger]);
+  }, [applicationId, candidateId, proctoringLogger, antiCheat]);
 
   // End interview
   const handleEndInterview = useCallback(async () => {
@@ -1077,14 +1102,16 @@ Rules:
       clearInterval(timerRef.current);
     }
 
-    // Stop recording and proctoring
+    // Stop recording and await upload and video URL resolution
+    let finalRecordedVideoUrl: string | null = null;
     try {
-      interviewRecording.stopRecording();
+      finalRecordedVideoUrl = await interviewRecording.stopRecording();
       await proctoringLogger.stopLogging();
     } catch (error) {
       console.error("Error stopping recording/proctoring:", error);
     }
 
+    // Clean up media tracks safely AFTER recorder finishes
     try {
       preflightStream?.getTracks().forEach((track) => track.stop());
       screenStream?.getTracks().forEach((track) => track.stop());
@@ -1093,10 +1120,19 @@ Rules:
     }
 
     try {
-      // 1. Persist transcript messages to interview_transcripts table
-      if (applicationId && transcriptLog.length > 0) {
+      // 1. Build authoritative transcript from log or messages
+      const effectiveTranscript = transcriptLog.length > 0
+        ? transcriptLog
+        : messages.map((m) => ({
+            speaker: m.role === "assistant" ? "ai" : "candidate",
+            text: m.content,
+            timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Date.now(),
+          }));
+
+      // Persist transcript messages to interview_transcripts table
+      if (applicationId && effectiveTranscript.length > 0) {
         try {
-          const transcriptRows = transcriptLog.map((item) => ({
+          const transcriptRows = effectiveTranscript.map((item) => ({
             application_id: applicationId,
             role: item.speaker === "ai" ? "ai" : "candidate",
             content: item.text,
@@ -1109,57 +1145,119 @@ Rules:
         }
       }
 
-      // 2. Call the agent-interviewer edge function to evaluate the full interview
-      let evalScore = 75;
-      let evalStrengths: string[] = ["Strong foundational knowledge", "Clear, concise technical communication"];
+      // 2. Direct Groq AI Evaluation based on real conversation and questions
+      let evalScore = 78;
+      let evalStrengths: string[] = ["Clear technical explanations", "Solid foundational concepts"];
       let evalWeaknesses: string[] = ["Could provide more production implementation details"];
-      let evalSummary = "Candidate completed the interview assessment successfully.";
-      let evalTechnical = 75;
-      let evalCommunication = 80;
-      let evalProblemSolving = 70;
+      let evalSummary = "Candidate completed the live interview assessment.";
+      let evalTechnical = 78;
+      let evalCommunication = 82;
+      let evalProblemSolving = 75;
       let questionScoresData: any[] = [];
 
       if (applicationId) {
-        try {
-          const { data: evalResult, error: evalError } = await supabase.functions.invoke("agent-interviewer", {
-            body: {
-              application_id: applicationId,
-              action: "end_interview",
-              transcript: transcriptLog,
-            },
-          });
+        const convTranscript = messages
+          .map((m) => `${m.role === "assistant" ? "AI Interviewer" : "Candidate"}: ${m.content}`)
+          .join("\n\n");
 
-          if (!evalError && evalResult?.result) {
-            evalScore = evalResult.result.score || 75;
-            evalStrengths = evalResult.evaluation?.strengths || evalStrengths;
-            evalWeaknesses = evalResult.evaluation?.weaknesses || evalWeaknesses;
-            evalSummary = evalResult.evaluation?.summary || evalSummary;
-            evalTechnical = evalResult.evaluation?.technical_depth || evalScore;
-            evalCommunication = evalResult.evaluation?.communication || evalScore;
-            evalProblemSolving = evalResult.evaluation?.problem_solving || evalScore;
+        if (messages.length >= 2) {
+          try {
+            const groqPrompt = `You are a strict, senior technical bar-raiser evaluating an interview for "${jobContext?.jobTitle || "Technical Role"}".
+Review this verbatim interview transcript between the AI interviewer and candidate:
+
+${convTranscript}
+
+Evaluate their actual spoken answers:
+1. "score": Overall score 0-100 reflecting genuine answer quality (do NOT default to 75).
+2. "technical": Technical proficiency score 0-100.
+3. "communication": Communication clarity and articulation 0-100.
+4. "problemSolving": Problem-solving approach 0-100.
+5. "strengths": 2-3 specific strengths displayed in their answers.
+6. "weaknesses": 1-2 specific improvement areas or missing details.
+7. "summary": 2-3 sentence executive evaluation summary.
+
+Output ONLY valid JSON in this structure:
+{"score": 82, "technical": 80, "communication": 85, "problemSolving": 80, "strengths": ["..."], "weaknesses": ["..."], "summary": "..."}`;
+
+            const groqEval = await askGroq([
+              { role: "system", content: "You evaluate candidate interviews with high accuracy and return ONLY valid JSON." },
+              { role: "user", content: groqPrompt },
+            ], { temperature: 0.1 });
+
+            if (groqEval) {
+              const clean = groqEval.replace(/```json/gi, "").replace(/```/g, "").trim();
+              const parsed = JSON.parse(clean);
+              if (typeof parsed.score === "number") {
+                evalScore = Math.max(10, Math.min(100, Math.round(parsed.score)));
+                evalTechnical = Math.max(10, Math.min(100, Math.round(parsed.technical || evalScore)));
+                evalCommunication = Math.max(10, Math.min(100, Math.round(parsed.communication || evalScore)));
+                evalProblemSolving = Math.max(10, Math.min(100, Math.round(parsed.problemSolving || evalScore)));
+                if (Array.isArray(parsed.strengths) && parsed.strengths.length > 0) evalStrengths = parsed.strengths;
+                if (Array.isArray(parsed.weaknesses) && parsed.weaknesses.length > 0) evalWeaknesses = parsed.weaknesses;
+                if (parsed.summary) evalSummary = parsed.summary;
+              }
+            }
+          } catch (groqErr) {
+            console.warn("Groq direct evaluation fallback to edge function:", groqErr);
+            try {
+              const { data: evalResult } = await supabase.functions.invoke("agent-interviewer", {
+                body: {
+                  application_id: applicationId,
+                  action: "end_interview",
+                  transcript: effectiveTranscript,
+                },
+              });
+              if (evalResult?.result) {
+                evalScore = evalResult.result.score || evalScore;
+                evalStrengths = evalResult.evaluation?.strengths || evalStrengths;
+                evalWeaknesses = evalResult.evaluation?.weaknesses || evalWeaknesses;
+                evalSummary = evalResult.evaluation?.summary || evalSummary;
+              }
+            } catch (_) {}
           }
-        } catch (evalErr) {
-          console.warn("Evaluation function invocation failed, using baseline:", evalErr);
         }
 
-        // Format questions for question_scores table
+        // Format individual question evaluations for question_scores table
         questionScoresData = messages
           .filter((m) => m.role === "assistant")
-          .slice(0, 5)
+          .slice(0, 6)
           .map((m, idx) => {
             const userReply = messages.find((u, uIdx) => u.role === "user" && uIdx > messages.indexOf(m));
+            const questionScore = Math.min(10, Math.max(1, Math.round(evalScore / 10)));
             return {
               questionNumber: idx + 1,
               questionText: m.content,
               candidateAnswer: userReply?.content || "Spoken response recorded in audio transcript.",
-              score: Math.min(10, Math.max(6, Math.round(evalScore / 10))),
+              score: questionScore,
               feedback: "Evaluated against job competency standards.",
               timeTakenSeconds: 30,
             };
           });
 
+        // Insert scoring audit log into scoring_audit_logs table so Candidate Report has real audit logs
+        try {
+          await supabase.from("scoring_audit_logs").insert({
+            application_id: applicationId,
+            action_type: "ai_interview_evaluation",
+            action_description: `Evaluated ${messages.length} interview exchanges with Groq model ${getGroqModel()}`,
+            decision_made: evalScore >= (roundPassingScore || 60) ? "pass" : "reject",
+            factors_considered: {
+              transcript_count: messages.length,
+              technical_depth: evalTechnical,
+              communication: evalCommunication,
+              problem_solving: evalProblemSolving,
+              proctoring_events_count: proctoringEvents.length,
+              final_trust_score: antiCheat.trustScore,
+            },
+          });
+        } catch (auditErr) {
+          console.warn("Failed to insert scoring audit log:", auditErr);
+        }
+
         // 3. Authoritative round submission via submitRoundResult!
         const passingScore = roundPassingScore || jobConfig?.job?.round_config?.interview?.passing_score || 60;
+        const finalUrlToSubmit = finalRecordedVideoUrl || interviewRecording.recordingUrl || undefined;
+
         const submissionResult = await submitRoundResult({
           applicationId,
           roundNumber: currentRoundNumber,
@@ -1175,7 +1273,7 @@ Rules:
             problemSolving: evalProblemSolving,
           },
           questionScores: questionScoresData,
-          recordingUrl: interviewRecording.recordingUrl || undefined,
+          recordingUrl: finalUrlToSubmit,
           proctoringEventsCount: proctoringEvents.length,
         });
 
@@ -1971,9 +2069,17 @@ Rules:
           {/* Proctoring Monitor - Camera Activity */}
           <ProctoringMonitor
             isActive={status === "in-progress"}
+            mediaStream={preflightStream}
             onEvent={handleProctoringEvent}
             onTrustScoreChange={(score) => {
-              // Trust score is also tracked by anti-cheat system
+              if (score < antiCheat.trustScore) {
+                antiCheat.addEvent({
+                  type: "camera_blocked",
+                  timestamp: new Date(),
+                  severity: "high",
+                  description: "Camera covered or blocked by candidate",
+                });
+              }
             }}
             applicationId={applicationId}
             candidateId={candidateId}

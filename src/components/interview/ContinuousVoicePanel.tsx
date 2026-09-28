@@ -146,6 +146,14 @@ export function ContinuousVoicePanel({
         if (silenceTimeoutRef.current) {
           clearTimeout(silenceTimeoutRef.current);
         }
+        // If candidate stops speaking mid-sentence for 1.8s, submit interim speech as final
+        silenceTimeoutRef.current = setTimeout(() => {
+          if (interim.trim() && !isLoadingRef.current) {
+            const spokenText = interim.trim();
+            setInterimTranscript("");
+            onSendMessageRef.current(spokenText);
+          }
+        }, 1800);
       }
 
       if (final && final.trim()) {
@@ -153,17 +161,19 @@ export function ContinuousVoicePanel({
         setInterimTranscript("");
         onCandidateSpeechRef.current?.(final.trim());
         
-        // Wait for silence before sending
+        // Wait for short silence before sending response
         if (silenceTimeoutRef.current) {
           clearTimeout(silenceTimeoutRef.current);
         }
         
         silenceTimeoutRef.current = setTimeout(() => {
           if (lastTranscriptRef.current && !isLoadingRef.current) {
-            onSendMessageRef.current(lastTranscriptRef.current);
+            const speechToSend = lastTranscriptRef.current;
             lastTranscriptRef.current = "";
+            setInterimTranscript("");
+            onSendMessageRef.current(speechToSend);
           }
-        }, 1000); // 1 second silence = send message
+        }, 1100); // 1.1s silence = commit spoken answer
       }
     };
 
@@ -313,6 +323,16 @@ export function ContinuousVoicePanel({
       clearTimeout(silenceTimeoutRef.current);
     }
   }, []);
+
+  // Auto-start continuous listening when autoListen is enabled
+  useEffect(() => {
+    if (autoListen && isSupported && !isContinuousMode) {
+      const timer = setTimeout(() => {
+        startContinuousListening();
+      }, 600);
+      return () => clearTimeout(timer);
+    }
+  }, [autoListen, isSupported, isContinuousMode, startContinuousListening]);
 
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {

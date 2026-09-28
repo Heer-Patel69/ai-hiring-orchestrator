@@ -99,6 +99,17 @@ export function useInterviewRecording({
         console.warn("Recording blob too small:", blob.size);
       }
 
+      // Store local object URL as guaranteed instant fallback
+      let localBlobUrl = "";
+      try {
+        localBlobUrl = URL.createObjectURL(blob);
+        if (typeof window !== "undefined" && app) {
+          sessionStorage.setItem(`interview_recording_${app}`, localBlobUrl);
+        }
+      } catch (blobErr) {
+        console.warn("Could not create object URL for recording blob:", blobErr);
+      }
+
       const timestamp = Date.now();
       const targetCand = cand || "anonymous";
       const targetApp = app || "unlinked_app";
@@ -127,23 +138,28 @@ export function useInterviewRecording({
       setRecordingStatus("finalizing");
 
       let videoUrl = "";
-      try {
-        const { data: signedData } = await supabase.storage
-          .from("interview-recordings")
-          .createSignedUrl(fileName, 60 * 60 * 24 * 365);
-        if (signedData?.signedUrl) {
-          videoUrl = signedData.signedUrl;
+      if (!uploadError) {
+        try {
+          const { data: signedData } = await supabase.storage
+            .from("interview-recordings")
+            .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+          if (signedData?.signedUrl) {
+            videoUrl = signedData.signedUrl;
+          }
+        } catch (e) {
+          console.warn("Failed to create signed URL:", e);
         }
-      } catch (e) {
-        console.warn("Failed to create signed URL:", e);
+
+        if (!videoUrl) {
+          const { data: urlData } = supabase.storage
+            .from("interview-recordings")
+            .getPublicUrl(fileName);
+          videoUrl = urlData?.publicUrl || fileName;
+        }
       }
 
-      if (!videoUrl) {
-        const { data: urlData } = supabase.storage
-          .from("interview-recordings")
-          .getPublicUrl(fileName);
-        videoUrl = urlData?.publicUrl || fileName;
-      }
+      // If storage upload failed or returned empty, use local blob URL
+      const finalPlayableUrl = videoUrl || localBlobUrl || fileName;
 
       // Update interview_recordings entry with ready status
       if (app) {
@@ -153,8 +169,8 @@ export function useInterviewRecording({
             .upsert({
               application_id: app,
               candidate_id: cand || undefined,
-              video_url: videoUrl,
-              recording_url: videoUrl,
+              video_url: finalPlayableUrl,
+              recording_url: finalPlayableUrl,
               duration_minutes: durationMinutes,
               status: "ready",
             }, {
@@ -172,15 +188,17 @@ export function useInterviewRecording({
       }
 
       setUploadProgress(100);
-      setRecordingUrl(videoUrl);
+      setRecordingUrl(finalPlayableUrl);
       setRecordingStatus("ready");
       
-      onRecordingComplete?.(videoUrl);
+      onRecordingComplete?.(finalPlayableUrl);
       chunksRef.current = [];
+      return finalPlayableUrl;
     } catch (err: any) {
       console.warn("Failed to finalize recording:", err);
       setError(err.message || "Failed to finalize recording");
       setRecordingStatus("failed");
+      return null;
     }
   }, [resolveIds, onRecordingComplete]);
 
@@ -297,21 +315,34 @@ export function useInterviewRecording({
   }, [resolveIds, handleRecordingComplete]);
 
   // Stop recording
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+  const stopRecording = useCallback((): Promise<string | null> => {
+    return new Promise((resolve) => {
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
+
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+        setIsRecording(false);
+        resolve(recordingUrl || null);
+        return;
+      }
+
+      mediaRecorderRef.current.onstop = async () => {
+        setRecordingStatus("finalizing");
+        const finalUrl = await handleRecordingComplete();
+        resolve(finalUrl || null);
+      };
+
       try {
         mediaRecorderRef.current.stop();
       } catch (err) {
         console.warn("Error stopping MediaRecorder:", err);
+        resolve(null);
       }
       setIsRecording(false);
-    }
-
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
-  }, []);
+    });
+  }, [handleRecordingComplete, recordingUrl]);
 
   const getStream = useCallback(() => streamRef.current, []);
 
