@@ -50,6 +50,8 @@ import {
   Monitor,
   MonitorOff,
   RefreshCw,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { GlassCard } from "@/components/ui/glass-card";
