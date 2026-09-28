@@ -65,10 +65,10 @@ export function LoginForm() {
       });
 
       // Navigate immediately based on role returned from signIn
-      if (role === "candidate") {
-        navigate("/candidate");
-      } else {
+      if (role === "interviewer") {
         navigate("/dashboard");
+      } else {
+        navigate("/candidate");
       }
     } catch (error: any) {
       console.error("Login error:", error);

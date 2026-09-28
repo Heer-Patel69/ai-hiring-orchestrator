@@ -113,12 +113,17 @@ export function InterviewerRegisterForm() {
   const onSubmit = async (data: FormData) => {
     setIsLoading(true);
     try {
-      // 1. Sign up the user
+      // 1. Sign up the user with role metadata
       const { data: authData, error: authError } = await supabase.auth.signUp({
         email: data.email,
         password: data.password,
         options: {
           emailRedirectTo: window.location.origin,
+          data: {
+            role: "interviewer",
+            full_name: data.fullName,
+            company_name: data.companyName,
+          },
         },
       });
 
