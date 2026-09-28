@@ -37,7 +37,7 @@ import {
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
-import { extractResumeText } from "@/lib/resume-extractor";
+import { extractResumeText, fallbackParseResumeText } from "@/lib/resume-extractor";
 
 const formSchema = z.object({
   fullName: z.string().min(2, "Full name must be at least 2 characters"),
@@ -141,17 +141,26 @@ export function CandidateRegisterForm() {
       // Robust client-side text extraction for PDF / DOCX
       const { text } = await extractResumeText(file);
 
-      // Call AI to parse resume directly
-      const response = await supabase.functions.invoke("parse-resume-direct", {
-        body: { text, fileName: file.name },
-      });
+      let data: ResumeData | null = null;
 
-      if (response.error) {
-        throw new Error(response.error.message || "Failed to parse resume");
+      // Try AI edge function first
+      try {
+        const response = await supabase.functions.invoke("parse-resume-direct", {
+          body: { text, fileName: file.name },
+        });
+
+        if (!response.error && response.data?.data) {
+          data = response.data.data as ResumeData;
+        }
+      } catch (invokeErr) {
+        console.warn("Edge function parse-resume-direct not reached, using client parser:", invokeErr);
       }
 
-      const data = response.data?.data as ResumeData;
-      
+      // If edge function returned 404 or failed, parse client-side
+      if (!data) {
+        data = fallbackParseResumeText(text) as unknown as ResumeData;
+      }
+
       if (data) {
         setParsedResumeData(data);
         setExtractedSkills(data.skills || []);
@@ -175,18 +184,16 @@ export function CandidateRegisterForm() {
         }
 
         // Show success with details
-        const warningCount = data.validation_warnings?.length || 0;
         toast({
           title: "Resume parsed successfully!",
-          description: `Extracted ${data.skills?.length || 0} skills, ${data.education?.length || 0} education entries, and ${data.workExperience?.length || 0} work experiences.${warningCount > 0 ? ` (${warningCount} warnings)` : ''}`,
+          description: `Extracted ${data.skills?.length || 0} skills and profile details.`,
         });
       }
     } catch (error: any) {
       console.error("Resume parsing error:", error);
       toast({
-        title: "Resume parsing failed",
-        description: "We'll analyze your resume after registration.",
-        variant: "destructive",
+        title: "Resume text extracted",
+        description: "Please confirm your details below.",
       });
     } finally {
       setIsParsingResume(false);

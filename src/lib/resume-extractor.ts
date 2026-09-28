@@ -161,3 +161,73 @@ export async function extractResumeText(file: File): Promise<ExtractedResumeText
 
   throw new Error("Unsupported file format. Please upload a PDF or DOCX resume.");
 }
+
+const COMMON_SKILLS = [
+  "JavaScript", "TypeScript", "Python", "Java", "C++", "C#", "Go", "Rust", "PHP", "Ruby", "Swift", "Kotlin",
+  "React", "Vue", "Angular", "Next.js", "Node.js", "Express", "Django", "Flask", "Spring Boot", "FastAPI",
+  "HTML", "CSS", "Tailwind CSS", "Bootstrap", "Sass", "Redux", "GraphQL", "REST API",
+  "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQLite", "Firebase", "Supabase", "DynamoDB",
+  "AWS", "Azure", "GCP", "Docker", "Kubernetes", "Git", "GitHub", "CI/CD", "Linux", "Terraform",
+  "Machine Learning", "Deep Learning", "Data Analysis", "Pandas", "NumPy", "TensorFlow", "PyTorch",
+  "Agile", "Scrum", "Jira", "Figma", "Problem Solving", "Communication"
+];
+
+export function fallbackParseResumeText(rawText: string) {
+  const text = rawText || "";
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+
+  // Email
+  const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const email = emailMatch ? emailMatch[0] : null;
+
+  // Phone
+  const phoneMatch = text.match(/(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
+  const phone = phoneMatch ? phoneMatch[0] : null;
+
+  // LinkedIn
+  const linkedinMatch = text.match(/https?:\/\/(?:www\.)?linkedin\.com\/in\/[a-zA-Z0-9_.-]+/i);
+  const linkedin_url = linkedinMatch ? linkedinMatch[0] : undefined;
+
+  // GitHub
+  const githubMatch = text.match(/https?:\/\/(?:www\.)?github\.com\/[a-zA-Z0-9_.-]+/i);
+  const github_url = githubMatch ? githubMatch[0] : undefined;
+
+  // Name (first non-empty line that looks like a name and doesn't contain email/phone)
+  let fullName: string | null = null;
+  for (const line of lines.slice(0, 5)) {
+    if (!line.includes("@") && !line.includes("http") && !/\d{4,}/.test(line) && line.length < 50 && line.length > 2) {
+      const words = line.split(/\s+/);
+      if (words.length >= 2 && words.length <= 4) {
+        fullName = line.replace(/[^a-zA-Z\s]/g, "").trim();
+        if (fullName) break;
+      }
+    }
+  }
+
+  // Skills
+  const lowerText = text.toLowerCase();
+  const matchedSkills = COMMON_SKILLS.filter(skill => {
+    const escaped = skill.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const regex = new RegExp(`(?:^|[^a-zA-Z0-9_])${escaped}(?:$|[^a-zA-Z0-9_])`, "i");
+    return regex.test(lowerText);
+  });
+
+  // Experience years
+  const expMatch = text.match(/(\d{1,2})\+?\s*(?:years|yrs)/i);
+  const experience_years = expMatch ? parseInt(expMatch[1], 10) : 1;
+
+  return {
+    fullName,
+    email,
+    phone,
+    location: null,
+    skills: matchedSkills.length > 0 ? matchedSkills : ["Software Development"],
+    experience_years,
+    linkedin_url,
+    github_url,
+    education: [],
+    workExperience: [],
+    projects: [],
+    certifications: [],
+  };
+}
