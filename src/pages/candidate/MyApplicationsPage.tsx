@@ -20,7 +20,10 @@ import {
   PlayCircle,
   MessageSquare,
   Zap,
+  RotateCcw,
+  Loader2,
 } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import {
   Accordion,
@@ -75,9 +78,11 @@ const statusConfig = {
 
 export default function MyApplicationsPage() {
   const { user } = useAuth();
+  const { toast } = useToast();
   const [applications, setApplications] = useState<Application[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [selectedStatus, setSelectedStatus] = useState<string>("all");
+  const [resettingAppId, setResettingAppId] = useState<string | null>(null);
 
   useEffect(() => {
     if (user) {
@@ -131,6 +136,50 @@ export default function MyApplicationsPage() {
       console.error("Error fetching applications:", error);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleRetakeApplication = async (appId: string) => {
+    if (!window.confirm("Are you sure you want to retake this interview? All your previous round scores will be cleared so you can start completely fresh from Round 1.")) {
+      return;
+    }
+    setResettingAppId(appId);
+    try {
+      // Clear all child records for this application
+      await supabase.from("round_results").delete().eq("application_id", appId);
+      await supabase.from("interview_transcripts").delete().eq("application_id", appId);
+      await supabase.from("interview_recordings").delete().eq("application_id", appId);
+      await supabase.from("proctoring_logs").delete().eq("application_id", appId);
+      await supabase.from("scoring_audit_logs").delete().eq("application_id", appId);
+      await supabase.from("candidate_scores").delete().eq("application_id", appId);
+
+      const { error } = await supabase
+        .from("applications")
+        .update({
+          status: "applied",
+          current_round: 0,
+          overall_score: null,
+          ai_confidence: null,
+          completed_at: null,
+        })
+        .eq("id", appId);
+
+      if (error) throw error;
+
+      toast({
+        title: "Interview Reset!",
+        description: "You can now begin a fresh interview from Round 1.",
+      });
+      await fetchApplications();
+    } catch (err: any) {
+      console.error("Error resetting application:", err);
+      toast({
+        title: "Reset Failed",
+        description: err.message || "Failed to reset application",
+        variant: "destructive",
+      });
+    } finally {
+      setResettingAppId(null);
     }
   };
 
@@ -378,6 +427,35 @@ export default function MyApplicationsPage() {
                             </ul>
                           </div>
                         )}
+
+                        {/* Retake / Fresh Interview Action */}
+                        <div className="pt-3 border-t border-border/60 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-secondary/20 p-3 rounded-lg">
+                          <div>
+                            <p className="text-sm font-medium">Retake this job interview?</p>
+                            <p className="text-xs text-muted-foreground">
+                              Reset your progress anytime to retake all rounds with fresh questions from Round 1.
+                            </p>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="border-primary/50 text-primary hover:bg-primary/10 flex items-center gap-1.5 shrink-0"
+                            onClick={() => handleRetakeApplication(app.id)}
+                            disabled={resettingAppId === app.id}
+                          >
+                            {resettingAppId === app.id ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                Resetting...
+                              </>
+                            ) : (
+                              <>
+                                <RotateCcw className="h-3.5 w-3.5" />
+                                Retake / Fresh Interview
+                              </>
+                            )}
+                          </Button>
+                        </div>
                       </div>
                     </AccordionContent>
                   </GlassCard>

@@ -24,6 +24,7 @@ import {
   Video,
   Loader2,
   AlertCircle,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -178,6 +179,64 @@ export default function JobDetailsPage() {
       toast({
         title: "Application Failed",
         description: error.message || "Failed to submit application",
+        variant: "destructive",
+      });
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const handleRetake = async () => {
+    if (!user || !job) return;
+    setIsApplying(true);
+    try {
+      const { data: existingApp } = await supabase
+        .from("applications")
+        .select("id")
+        .eq("job_id", job.id)
+        .eq("candidate_id", user.id)
+        .maybeSingle();
+
+      if (existingApp) {
+        await supabase.from("round_results").delete().eq("application_id", existingApp.id);
+        await supabase.from("interview_transcripts").delete().eq("application_id", existingApp.id);
+        await supabase.from("interview_recordings").delete().eq("application_id", existingApp.id);
+        await supabase.from("proctoring_logs").delete().eq("application_id", existingApp.id);
+        await supabase.from("scoring_audit_logs").delete().eq("application_id", existingApp.id);
+        await supabase.from("candidate_scores").delete().eq("application_id", existingApp.id);
+
+        const { error } = await supabase
+          .from("applications")
+          .update({
+            status: "applied",
+            current_round: 0,
+            overall_score: null,
+            ai_confidence: null,
+            completed_at: null,
+          })
+          .eq("id", existingApp.id);
+
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from("applications").insert({
+          job_id: job.id,
+          candidate_id: user.id,
+          status: "applied",
+          current_round: 0,
+        });
+        if (error) throw error;
+      }
+
+      toast({
+        title: "Fresh Application Started!",
+        description: "You can now begin a fresh interview from Round 1.",
+      });
+      navigate("/candidate/applications");
+    } catch (error: any) {
+      console.error("Error resetting application:", error);
+      toast({
+        title: "Reset Failed",
+        description: error.message || "Failed to start fresh interview",
         variant: "destructive",
       });
     } finally {
@@ -373,15 +432,34 @@ export default function JobDetailsPage() {
           {/* Apply Card */}
           <GlassCard className="sticky top-24">
             {hasApplied ? (
-              <div className="text-center py-4">
+              <div className="text-center py-4 space-y-3">
                 <CheckCircle className="mx-auto h-12 w-12 text-success" />
                 <h3 className="mt-3 text-lg font-semibold">Already Applied</h3>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  You've already applied for this position.
+                  You've already applied for this position. You can view your current progress or retake a fresh interview anytime.
                 </p>
-                <Button variant="outline" className="mt-4 w-full" asChild>
-                  <Link to="/candidate/applications">View Application</Link>
-                </Button>
+                <div className="space-y-2 pt-2">
+                  <Button variant="outline" className="w-full" asChild>
+                    <Link to="/candidate/applications">View Current Application</Link>
+                  </Button>
+                  <Button
+                    className="w-full bg-primary hover:bg-primary/90 flex items-center justify-center gap-2"
+                    onClick={handleRetake}
+                    disabled={isApplying}
+                  >
+                    {isApplying ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Resetting...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="h-4 w-4" />
+                        Retake / Fresh Interview
+                      </>
+                    )}
+                  </Button>
+                </div>
               </div>
             ) : showConfirmation ? (
               <div className="space-y-4">
