@@ -109,9 +109,15 @@ export default function CandidateOverviewPage() {
           status,
           current_round,
           job:jobs(
+            id,
             title,
             field,
-            interviewer_id
+            interviewer_id,
+            job_rounds(
+              id,
+              round_number,
+              round_type
+            )
           )
         `)
         .eq("candidate_id", user!.id)
@@ -360,25 +366,42 @@ export default function CandidateOverviewPage() {
             ) : (
               <div className="space-y-3">
                 {applications
-                  .filter(a => a.status === "interviewing")
+                  .filter((a) => a.status === "interviewing" || a.status === "applied" || a.status === "screening")
                   .slice(0, 3)
-                  .map((app) => (
-                    <div
-                      key={app.id}
-                      className="flex items-center justify-between rounded-xl bg-secondary/50 p-3 hover:bg-secondary/70 transition-colors"
-                    >
-                      <div>
-                        <p className="font-medium">{app.job?.title}</p>
-                        <p className="text-sm text-muted-foreground">Round {app.current_round}</p>
+                  .map((app) => {
+                    const nextRoundNum = (app.current_round || 0) + 1;
+                    const roundConfig = (app.job as any)?.job_rounds?.find((r: any) => r.round_number === nextRoundNum);
+                    const roundType = roundConfig?.round_type || "live_ai_interview";
+                    const route = roundType === "mcq"
+                      ? `/candidate/assessment/mcq?application=${app.id}`
+                      : roundType === "coding" || roundType === "dsa"
+                      ? `/candidate/assessment/coding?application=${app.id}`
+                      : roundType === "behavioral"
+                      ? `/candidate/interview/live?type=behavioral&application=${app.id}`
+                      : roundType === "system_design"
+                      ? `/candidate/interview/live?type=system-design&application=${app.id}`
+                      : `/candidate/interview/live?application=${app.id}`;
+
+                    return (
+                      <div
+                        key={app.id}
+                        className="flex items-center justify-between rounded-xl bg-secondary/50 p-3 hover:bg-secondary/70 transition-colors"
+                      >
+                        <div>
+                          <p className="font-medium">{app.job?.title}</p>
+                          <p className="text-sm text-muted-foreground">
+                            Round {nextRoundNum} ({roundType.replace("_", " ")})
+                          </p>
+                        </div>
+                        <Button size="sm" className="bg-success hover:bg-success/90" asChild>
+                          <Link to={route}>
+                            Start
+                            <ArrowRight className="ml-1 h-3 w-3" />
+                          </Link>
+                        </Button>
                       </div>
-                      <Button size="sm" className="bg-success hover:bg-success/90" asChild>
-                        <Link to="/candidate/interview">
-                          Start
-                          <ArrowRight className="ml-1 h-3 w-3" />
-                        </Link>
-                      </Button>
-                    </div>
-                  ))}
+                    );
+                  })}
               </div>
             )}
           </GlassCard>

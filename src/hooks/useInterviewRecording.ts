@@ -29,13 +29,164 @@ export function useInterviewRecording({
   const startTimeRef = useRef<Date | null>(null);
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  const appIdRef = useRef<string | null>(applicationId);
+  const candIdRef = useRef<string | null>(candidateId);
+
+  useEffect(() => {
+    if (applicationId) appIdRef.current = applicationId;
+    if (candidateId) candIdRef.current = candidateId;
+  }, [applicationId, candidateId]);
+
+  // Robust resolver for candidate and application IDs
+  const resolveIds = useCallback(async () => {
+    let app = appIdRef.current || applicationId;
+    let cand = candIdRef.current || candidateId;
+
+    if (!cand) {
+      try {
+        const { data } = await supabase.auth.getUser();
+        if (data?.user?.id) {
+          cand = data.user.id;
+          candIdRef.current = cand;
+        }
+      } catch (e) {
+        console.warn("Could not resolve user for recording:", e);
+      }
+    }
+
+    if (!app && typeof window !== "undefined") {
+      const sp = new URLSearchParams(window.location.search);
+      app = sp.get("application") || sp.get("appId");
+      if (app) appIdRef.current = app;
+    }
+
+    if (!app && cand) {
+      try {
+        const { data } = await supabase
+          .from("applications")
+          .select("id")
+          .eq("candidate_id", cand)
+          .order("applied_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (data?.id) {
+          app = data.id;
+          appIdRef.current = app;
+        }
+      } catch (e) {
+        console.warn("Could not resolve active application for recording:", e);
+      }
+    }
+
+    return { app, cand };
+  }, [applicationId, candidateId]);
+
+  // Handle recording completion and upload
+  const handleRecordingComplete = useCallback(async () => {
+    if (chunksRef.current.length === 0) {
+      setRecordingStatus("not_started");
+      return;
+    }
+
+    const { app, cand } = await resolveIds();
+
+    try {
+      setRecordingStatus("uploading");
+      setUploadProgress(20);
+      
+      const blob = new Blob(chunksRef.current, { type: "video/webm" });
+      if (blob.size < 1000) {
+        console.warn("Recording blob too small:", blob.size);
+      }
+
+      const timestamp = Date.now();
+      const targetCand = cand || "anonymous";
+      const targetApp = app || "unlinked_app";
+      const fileName = `${targetCand}/${targetApp}_${timestamp}.webm`;
+
+      const durationMinutes = startTimeRef.current
+        ? Math.max(1, Math.ceil((Date.now() - startTimeRef.current.getTime()) / 60000))
+        : 1;
+
+      setUploadProgress(50);
+
+      // Upload to Supabase Storage
+      const { error: uploadError } = await supabase.storage
+        .from("interview-recordings")
+        .upload(fileName, blob, {
+          contentType: "video/webm",
+          cacheControl: "3600",
+          upsert: true,
+        });
+
+      if (uploadError) {
+        console.warn("Upload to interview-recordings storage error:", uploadError);
+      }
+
+      setUploadProgress(80);
+      setRecordingStatus("finalizing");
+
+      let videoUrl = "";
+      try {
+        const { data: signedData } = await supabase.storage
+          .from("interview-recordings")
+          .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+        if (signedData?.signedUrl) {
+          videoUrl = signedData.signedUrl;
+        }
+      } catch (e) {
+        console.warn("Failed to create signed URL:", e);
+      }
+
+      if (!videoUrl) {
+        const { data: urlData } = supabase.storage
+          .from("interview-recordings")
+          .getPublicUrl(fileName);
+        videoUrl = urlData?.publicUrl || fileName;
+      }
+
+      // Update interview_recordings entry with ready status
+      if (app) {
+        try {
+          const { data: recording } = await supabase
+            .from("interview_recordings")
+            .upsert({
+              application_id: app,
+              candidate_id: cand || undefined,
+              video_url: videoUrl,
+              recording_url: videoUrl,
+              duration_minutes: durationMinutes,
+              status: "ready",
+            }, {
+              onConflict: "application_id",
+            })
+            .select()
+            .maybeSingle();
+
+          if (recording) {
+            setRecordingId(recording.id);
+          }
+        } catch (dbErr) {
+          console.warn("Failed to update interview_recordings table:", dbErr);
+        }
+      }
+
+      setUploadProgress(100);
+      setRecordingUrl(videoUrl);
+      setRecordingStatus("ready");
+      
+      onRecordingComplete?.(videoUrl);
+      chunksRef.current = [];
+    } catch (err: any) {
+      console.warn("Failed to finalize recording:", err);
+      setError(err.message || "Failed to finalize recording");
+      setRecordingStatus("failed");
+    }
+  }, [resolveIds, onRecordingComplete]);
+
   // Start recording - accepts an optional existing preflight stream to prevent device conflicts
   const startRecording = useCallback(async (providedStream?: MediaStream) => {
-    if (!applicationId || !candidateId) {
-      setError("Missing application or candidate ID");
-      console.warn("Recording failed: Missing IDs", { applicationId, candidateId });
-      return false;
-    }
+    const { app, cand } = await resolveIds();
 
     try {
       let stream = providedStream;
@@ -107,19 +258,26 @@ export function useInterviewRecording({
       setError(null);
       setUploadProgress(0);
 
-      // Create initial recording entry in database
-      const { data: recordingEntry } = await supabase
-        .from("interview_recordings")
-        .insert({
-          application_id: applicationId,
-          status: "recording",
-          duration_minutes: 0,
-        })
-        .select()
-        .maybeSingle();
+      // Create initial recording entry in database if app is known
+      if (app) {
+        try {
+          const { data: recordingEntry } = await supabase
+            .from("interview_recordings")
+            .insert({
+              application_id: app,
+              candidate_id: cand || undefined,
+              status: "recording",
+              duration_minutes: 0,
+            })
+            .select()
+            .maybeSingle();
 
-      if (recordingEntry) {
-        setRecordingId(recordingEntry.id);
+          if (recordingEntry) {
+            setRecordingId(recordingEntry.id);
+          }
+        } catch (dbErr) {
+          console.warn("Failed to insert initial recording row:", dbErr);
+        }
       }
 
       return true;
@@ -136,84 +294,7 @@ export function useInterviewRecording({
       setRecordingStatus("failed");
       return false;
     }
-  }, [applicationId, candidateId]);
-
-  // Handle recording completion and upload
-  const handleRecordingComplete = useCallback(async () => {
-    if (chunksRef.current.length === 0 || !applicationId || !candidateId) {
-      setRecordingStatus("failed");
-      return;
-    }
-
-    try {
-      setRecordingStatus("uploading");
-      setUploadProgress(20);
-      
-      const blob = new Blob(chunksRef.current, { type: "video/webm" });
-      if (blob.size < 1000) {
-        console.warn("Recording blob too small");
-      }
-
-      const timestamp = Date.now();
-      const fileName = `${candidateId}/${applicationId}_${timestamp}.webm`;
-
-      const durationMinutes = startTimeRef.current
-        ? Math.ceil((Date.now() - startTimeRef.current.getTime()) / 60000)
-        : 1;
-
-      setUploadProgress(50);
-
-      // Upload to Supabase Storage
-      const { error: uploadError } = await supabase.storage
-        .from("interview-recordings")
-        .upload(fileName, blob, {
-          contentType: "video/webm",
-          cacheControl: "3600",
-          upsert: true,
-        });
-
-      if (uploadError) {
-        console.warn("Upload to interview-recordings storage error:", uploadError);
-      }
-
-      setUploadProgress(80);
-      setRecordingStatus("finalizing");
-
-      const { data: urlData } = supabase.storage
-        .from("interview-recordings")
-        .getPublicUrl(fileName);
-
-      const videoUrl = urlData?.publicUrl || fileName;
-
-      // Update interview_recordings entry with ready status
-      const { data: recording } = await supabase
-        .from("interview_recordings")
-        .upsert({
-          application_id: applicationId,
-          video_url: videoUrl,
-          duration_minutes: durationMinutes,
-          status: "ready",
-        }, {
-          onConflict: "application_id",
-        })
-        .select()
-        .maybeSingle();
-
-      setUploadProgress(100);
-      setRecordingUrl(videoUrl);
-      setRecordingStatus("ready");
-      if (recording) {
-        setRecordingId(recording.id);
-      }
-      
-      onRecordingComplete?.(videoUrl);
-      chunksRef.current = [];
-    } catch (err: any) {
-      console.warn("Failed to finalize recording:", err);
-      setError(err.message || "Failed to finalize recording");
-      setRecordingStatus("failed");
-    }
-  }, [applicationId, candidateId, onRecordingComplete]);
+  }, [resolveIds, handleRecordingComplete]);
 
   // Stop recording
   const stopRecording = useCallback(() => {

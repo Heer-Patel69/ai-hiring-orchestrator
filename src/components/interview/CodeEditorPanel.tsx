@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
+import { analyzeCode } from "@/lib/code-analyzer";
 
 interface TestCase {
   input: string;
@@ -150,15 +151,11 @@ export function CodeEditorPanel({
     setActiveTab("results");
 
     try {
-      const { data, error } = await supabase.functions.invoke("analyze-code", {
-        body: {
-          code,
-          language,
-          testCases: testCases.length > 0 ? testCases : undefined,
-        },
+      const data = await analyzeCode({
+        code,
+        language,
+        testCases: testCases.length > 0 ? testCases : undefined,
       });
-
-      if (error) throw error;
 
       setAnalysis(data);
       onAnalysisComplete?.(data);
@@ -167,6 +164,11 @@ export function CodeEditorPanel({
         toast({
           title: "Great job! 🎉",
           description: `Your solution scored ${data.overallScore}/100`,
+        });
+      } else {
+        toast({
+          title: "Code Analyzed",
+          description: `Analysis completed with overall score: ${data.overallScore}/100`,
         });
       }
     } catch (error) {

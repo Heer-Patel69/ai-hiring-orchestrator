@@ -47,6 +47,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
 import { submitRoundResult } from "@/lib/round-submission";
 import { useJobRoundConfig, useNextRound } from "@/hooks/useJobRoundConfig";
+import { analyzeCode } from "@/lib/code-analyzer";
 
 interface CodingProblem {
   id: string;
@@ -306,18 +307,14 @@ Return the head of the merged linked list.`,
     setActiveTab("output");
 
     try {
-      const { data, error } = await supabase.functions.invoke("analyze-code", {
-        body: {
-          code: currentCode,
-          language,
-          testCases: currentProblem.examples.map((e) => ({
-            input: e.input,
-            expectedOutput: e.output,
-          })),
-        },
+      const data = await analyzeCode({
+        code: currentCode,
+        language,
+        testCases: currentProblem.examples.map((e) => ({
+          input: e.input,
+          expectedOutput: e.output,
+        })),
       });
-
-      if (error) throw error;
 
       if (data?.compilerError) {
         setCompilerError(data.compilerError);
@@ -336,7 +333,7 @@ Return the head of the merged linked list.`,
       setTestResults(results);
 
       toast({
-        title: results.every((r) => r.passed) ? "All tests passed! 🎉" : "Some tests failed",
+        title: results.every((r) => r.passed) ? "All tests passed! 🎉" : "Tests analyzed",
         description: `${results.filter((r) => r.passed).length}/${results.length} tests passed`,
       });
     } catch (error) {
@@ -356,14 +353,10 @@ Return the head of the merged linked list.`,
     setIsRunning(true);
 
     try {
-      const { data, error } = await supabase.functions.invoke("analyze-code", {
-        body: {
-          code: currentCode,
-          language,
-        },
+      const data = await analyzeCode({
+        code: currentCode,
+        language,
       });
-
-      if (error) throw error;
 
       const timeTaken = Math.round((Date.now() - (startTimeRef.current[currentProblem.id] || Date.now())) / 1000);
 

@@ -42,6 +42,12 @@ interface Application {
     field: string;
     num_rounds: number;
     toughness_level: string;
+    job_rounds?: Array<{
+      id: string;
+      round_number: number;
+      round_type: string;
+      duration_minutes: number;
+    }>;
   };
   round_results: RoundResult[];
 }
@@ -95,7 +101,13 @@ export default function MyApplicationsPage() {
             title,
             field,
             num_rounds,
-            toughness_level
+            toughness_level,
+            job_rounds(
+              id,
+              round_number,
+              round_type,
+              duration_minutes
+            )
           ),
           round_results(
             id,
@@ -262,16 +274,25 @@ export default function MyApplicationsPage() {
                             
                             <div className="space-y-4">
                               {Array.from({ length: app.job?.num_rounds || 0 }).map((_, idx) => {
+                                const roundNum = idx + 1;
+                                const configuredRound = app.job?.job_rounds?.find(
+                                  (jr) => jr.round_number === roundNum
+                                );
                                 const roundResult = app.round_results?.find(
-                                  (r) => r.round?.round_number === idx + 1
+                                  (r) => r.round?.round_number === roundNum
                                 );
                                 const isCompleted = !!roundResult?.completed_at;
-                                const isUnlocked = idx <= (app.current_round || 0);
-                                const isCurrent = idx === (app.current_round || 0) && (app.status === "interviewing" || app.status === "applied" || app.status === "screening");
+                                const activeRoundNum = (app.current_round || 0) + 1;
+                                const isUnlocked = roundNum <= activeRoundNum;
+                                const isCurrent = roundNum === activeRoundNum && (app.status === "interviewing" || app.status === "applied" || app.status === "screening");
 
-                                const getRoundRoute = (roundType?: string) => {
-                                  if (roundType === "coding") return `/candidate/assessment/coding?application=${app.id}`;
+                                const effectiveRoundType = roundResult?.round?.round_type || configuredRound?.round_type || "live_ai_interview";
+
+                                const getRoundRoute = (roundType: string) => {
+                                  if (roundType === "coding" || roundType === "dsa") return `/candidate/assessment/coding?application=${app.id}`;
                                   if (roundType === "mcq") return `/candidate/assessment/mcq?application=${app.id}`;
+                                  if (roundType === "behavioral") return `/candidate/interview/live?type=behavioral&application=${app.id}`;
+                                  if (roundType === "system_design") return `/candidate/interview/live?type=system-design&application=${app.id}`;
                                   return `/candidate/interview/live?application=${app.id}`;
                                 };
 
@@ -301,12 +322,10 @@ export default function MyApplicationsPage() {
                                       <div className="flex items-center justify-between">
                                         <div>
                                           <p className="font-medium">
-                                            Round {idx + 1}
-                                            {roundResult?.round && (
-                                              <span className="ml-2 text-muted-foreground capitalize">
-                                                ({roundResult.round.round_type.replace("_", " ")})
-                                              </span>
-                                            )}
+                                            Round {roundNum}
+                                            <span className="ml-2 text-muted-foreground capitalize">
+                                              ({effectiveRoundType.replace("_", " ")})
+                                            </span>
                                           </p>
                                           {isCompleted && roundResult?.score !== null && (
                                             <p className="text-sm text-success">
@@ -316,7 +335,7 @@ export default function MyApplicationsPage() {
                                         </div>
                                         {isCurrent && (
                                           <Button size="sm" className="bg-success hover:bg-success/90" asChild>
-                                            <Link to={getRoundRoute(roundResult?.round?.round_type)}>
+                                            <Link to={getRoundRoute(effectiveRoundType)}>
                                               <PlayCircle className="mr-1 h-3 w-3" />
                                               Start
                                             </Link>
