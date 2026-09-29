@@ -14,10 +14,7 @@ export interface GroqChatMessage {
 }
 
 export function getGroqApiKey(): string {
-  return (
-    import.meta.env.VITE_GROQ_API_KEY ||
-    ""
-  ).trim();
+  return (import.meta.env.VITE_GROQ_API_KEY || "").trim();
 }
 
 export function getGroqModel(): string {

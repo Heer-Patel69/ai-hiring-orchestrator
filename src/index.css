@@ -6,14 +6,34 @@
 
 /* The interview owns the viewport; only the conversation, tools and diagnostics scroll. */
 .interview-grid {
-  grid-template-columns: minmax(220px, 0.75fr) minmax(340px, 1.25fr) minmax(380px, 1.35fr);
+  display: grid;
+  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr) minmax(0, 1.15fr);
   grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  max-width: 100vw;
+  box-sizing: border-box;
 }
-@media (min-width: 768px) and (max-width: 1450px) {
-  .interview-grid { grid-template-columns: minmax(200px, 0.65fr) minmax(330px, 1.2fr) minmax(360px, 1.25fr); }
+
+.interview-grid.conversation-mode {
+  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
 }
-@media (min-width: 768px) and (max-width: 1100px) {
-  .interview-grid { grid-template-columns: minmax(160px, 0.6fr) minmax(280px, 1.1fr) minmax(300px, 1.2fr); }
+
+@media (max-width: 1200px) {
+  .interview-grid {
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .interview-grid.conversation-mode {
+    grid-template-columns: minmax(180px, 230px) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .interview-grid {
+    grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+  }
+  .interview-grid.conversation-mode {
+    grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+  }
 }
 
 @layer base {

@@ -1033,7 +1033,10 @@ Use the candidate's latest response as the primary context for your follow-up qu
 Do NOT repeat previously asked questions:
 ${asked}
 
-Do NOT use generic filler ("Thank you for that"). Directly ask the next technical or behavioral question.`;
+CONVERSATIONAL & NATURAL INTERACTION GUIDELINES:
+- When the candidate offers a greeting, pleasantry, or check-in (such as "hi", "hello", "hey", "can you hear me?"), respond warmly, naturally, and conversationally like a real human senior interviewer (e.g., "Hello! Welcome. I can hear you clearly. When you're ready, let's start with...").
+- Do NOT output robotic templates like "Good answer, let's move to question 2".
+- Maintain genuine conversational flow and acknowledge the candidate's real statements.`;
 
         const groqMessages = [
           { role: "system" as const, content: systemPrompt },
@@ -2170,7 +2173,10 @@ Output ONLY valid JSON in this structure:
 
       {recordingRecovery}
       {/* Main Content Grid */}
-      <div className="flex-1 min-h-0 w-full interview-grid grid gap-2 sm:gap-2.5 p-2 sm:p-2.5 overflow-hidden">
+      <div className={cn(
+        "flex-1 min-h-0 w-full interview-grid grid gap-2 sm:gap-2.5 p-2 sm:p-2.5 overflow-hidden",
+        workspaceMode === "conversation" && "conversation-mode"
+      )}>
         {/* Left Panel - Video + Proctoring */}
         <div className="flex flex-col gap-2 h-full min-h-0 min-w-0 overflow-y-auto pr-1">
           <VideoPanel
@@ -2214,10 +2220,7 @@ Output ONLY valid JSON in this structure:
         </div>
 
         {/* Center Panel - Conversation */}
-        <div className={cn(
-          "flex flex-col gap-1.5 h-full min-h-0 min-w-0 overflow-hidden",
-          workspaceMode === "conversation" ? "col-span-2" : ""
-        )}>
+        <div className="flex flex-col gap-1.5 h-full min-h-0 min-w-0 overflow-hidden">
           {/* Candidate & Job Info Strip */}
           <div className="shrink-0 flex items-center justify-between px-2.5 py-1 rounded-lg bg-secondary/30 border border-border/40 text-[11px] sm:text-xs">
             <div className="flex items-center gap-1.5">

@@ -223,9 +223,6 @@ export function ProctoringMonitor({
         videoRef.current.srcObject = null;
         videoRef.current = null;
       }
-      if (isSelfAllocated && localStream) {
-        localStream.getTracks().forEach((track) => track.stop());
-      }
     };
   }, [isActive, enableCameraMonitoring, mediaStream, logProctoringEvent]);
 

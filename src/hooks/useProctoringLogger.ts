@@ -50,23 +50,51 @@ export function useProctoringLogger({
   const startTimeRef = useRef<Date | null>(null);
   const recordedRef = useRef(false);
 
+  const ALLOWED_DB_EVENT_TYPES = new Set([
+    "face_detected", "face_not_visible", "multiple_faces",
+    "looking_away", "tab_switch", "copy_paste",
+    "audio_anomaly", "suspicious_movement", "recording_started",
+    "recording_stopped", "camera_blocked", "screen_share_detected"
+  ]);
+
+  const isValidUUID = (id?: string | null): boolean => {
+    return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  };
+
+  const normalizeEventType = (type: string): string => {
+    if (ALLOWED_DB_EVENT_TYPES.has(type)) return type;
+    if (type.startsWith("screen_share_")) return "screen_share_detected";
+    if (type.startsWith("camera_")) return "camera_blocked";
+    return "suspicious_movement";
+  };
+
   // Flush events to database
   const flushEvents = useCallback(async () => {
     if (eventBuffer.current.length === 0 || !applicationId || !candidateId) return;
+
+    if (!isValidUUID(applicationId) || !isValidUUID(candidateId)) {
+      // If IDs are not valid UUIDs, discard buffer to avoid 400 DB errors
+      eventBuffer.current = [];
+      return;
+    }
 
     const eventsToFlush = [...eventBuffer.current];
     eventBuffer.current = [];
 
     try {
+      const validRecordingId = isValidUUID(recordingId) ? recordingId : null;
       const logsToInsert = eventsToFlush.map((event) => ({
         application_id: applicationId,
-        recording_id: recordingId || null,
+        recording_id: validRecordingId,
         candidate_id: candidateId,
-        event_type: event.type,
+        event_type: normalizeEventType(event.type),
         severity: event.severity === "critical" ? "high" : event.severity,
         description: event.description,
         timestamp_in_video: event.timestampInVideo || null,
-        metadata: event.metadata || {},
+        metadata: {
+          original_event_type: event.type,
+          ...(event.metadata || {})
+        },
         trust_score_impact: getSeverityImpact(event.severity),
       }));
 
@@ -75,13 +103,12 @@ export function useProctoringLogger({
         .insert(logsToInsert);
 
       if (error) {
-        console.warn("Failed to log proctoring events:", error);
-        // Put events back in buffer for retry
-        eventBuffer.current = [...eventsToFlush, ...eventBuffer.current];
+        console.warn("Failed to log proctoring events:", error.message || error);
+        // Do not re-buffer to prevent infinite 400 error loop
       }
     } catch (error) {
       console.warn("Error flushing proctoring events:", error);
-      eventBuffer.current = [...eventsToFlush, ...eventBuffer.current];
+      // Do not re-buffer
     }
   }, [applicationId, recordingId, candidateId]);
 

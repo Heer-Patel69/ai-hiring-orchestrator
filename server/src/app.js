@@ -265,16 +265,29 @@ export function createApp(config) {
   });
   app.use((req, res, next) => {
     const origin = req.get("origin")?.replace(/\/$/, "");
-    if (origin && !config.allowedOrigins.has(origin)) {
-      return apiError(res, 403, "ORIGIN_NOT_ALLOWED", "This origin is not allowed", req.requestId);
-    }
-    if (origin) {
+    const isAllowed =
+      !origin ||
+      config.allowedOrigins.has(origin) ||
+      origin.endsWith(".vercel.app") ||
+      origin.includes("localhost") ||
+      origin.includes("127.0.0.1") ||
+      config.appEnv !== "production";
+
+    if (origin && isAllowed) {
       res.set("Access-Control-Allow-Origin", origin);
       res.set("Vary", "Origin");
-      res.set("Access-Control-Allow-Headers", "authorization, content-type, x-request-id");
+      res.set("Access-Control-Allow-Headers", "authorization, content-type, x-request-id, apikey");
       res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.set("Access-Control-Allow-Credentials", "true");
     }
-    if (req.method === "OPTIONS") return res.sendStatus(204);
+
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(204);
+    }
+
+    if (origin && !isAllowed) {
+      return apiError(res, 403, "ORIGIN_NOT_ALLOWED", "This origin is not allowed", req.requestId);
+    }
     next();
   });
   app.use(express.json({ limit: "28mb" }));
