@@ -126,6 +126,7 @@ export function TextToSpeech({
 export interface UseTextToSpeechOptions {
   onWordBoundary?: (wordIndex: number, currentWord: string, totalWords: number) => void;
   onEnd?: () => void;
+  onError?: (message: string) => void;
 }
 
 export function useTextToSpeech(options?: UseTextToSpeechOptions) {
@@ -133,133 +134,76 @@ export function useTextToSpeech(options?: UseTextToSpeechOptions) {
   const [currentWordIndex, setCurrentWordIndex] = useState(-1);
   const [currentWord, setCurrentWord] = useState("");
   const [words, setWords] = useState<string[]>([]);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const wordsRef = useRef<string[]>([]);
-  const onWordRef = useRef(options?.onWordBoundary);
-  const onEndRef = useRef(options?.onEnd);
-
-  useEffect(() => {
-    onWordRef.current = options?.onWordBoundary;
-    onEndRef.current = options?.onEnd;
-  }, [options?.onWordBoundary, options?.onEnd]);
-
-  const clearTimer = useCallback(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-  }, []);
-
-  const speak = useCallback((text: string, customOnWord?: (idx: number, word: string) => void) => {
-    if (!text || typeof window === "undefined" || !window.speechSynthesis) return;
-
-    clearTimer();
-    window.speechSynthesis.cancel();
-    if (window.speechSynthesis.paused) {
-      window.speechSynthesis.resume();
-    }
-
-    const splitWords = text.trim().split(/\s+/).filter(Boolean);
-    setWords(splitWords);
-    wordsRef.current = splitWords;
-    setCurrentWordIndex(0);
-    setCurrentWord(splitWords[0] || "");
-    if (splitWords.length > 0) {
-      customOnWord?.(0, splitWords[0]);
-      onWordRef.current?.(0, splitWords[0], splitWords.length);
-    }
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.95; // Slightly measured for professional clarity
-    utterance.pitch = 1.0;
-    utterance.volume = 1.0;
-
-    const voices = window.speechSynthesis.getVoices();
-    const voice = voices.find(
-      (v) => v.lang.startsWith("en-") && (v.name.includes("Google") || v.name.includes("Microsoft") || v.name.includes("Natural"))
-    ) || voices.find((v) => v.lang.startsWith("en-"));
-    
-    if (voice) utterance.voice = voice;
-
-    let boundaryFired = false;
-
-    utterance.onstart = () => {
-      setIsSpeaking(true);
-      // Fallback timer: advances word-by-word at ~260ms cadence if browser doesn't emit onboundary
-      let wordIdx = 0;
-      timerRef.current = setInterval(() => {
-        if (!boundaryFired && wordIdx < wordsRef.current.length - 1) {
-          wordIdx++;
-          setCurrentWordIndex(wordIdx);
-          const w = wordsRef.current[wordIdx];
-          setCurrentWord(w);
-          customOnWord?.(wordIdx, w);
-          onWordRef.current?.(wordIdx, w, wordsRef.current.length);
-        }
-      }, 260);
-    };
-
-    utterance.onboundary = (event) => {
-      if (event.name === "word") {
-        boundaryFired = true;
-        clearTimer();
-        // Calculate word index from charIndex
-        const textBefore = text.slice(0, event.charIndex);
-        const idx = textBefore.trim().split(/\s+/).filter(Boolean).length;
-        const currentIdx = Math.min(idx, wordsRef.current.length - 1);
-        setCurrentWordIndex(currentIdx);
-        const w = wordsRef.current[currentIdx] || "";
-        setCurrentWord(w);
-        customOnWord?.(currentIdx, w);
-        onWordRef.current?.(currentIdx, w, wordsRef.current.length);
-      }
-    };
-
-    utterance.onend = () => {
-      clearTimer();
-      setIsSpeaking(false);
-      setCurrentWordIndex(wordsRef.current.length);
-      setCurrentWord("");
-      onEndRef.current?.();
-    };
-
-    utterance.onerror = (err) => {
-      console.warn("SpeechSynthesis error:", err);
-      clearTimer();
-      setIsSpeaking(false);
-      setCurrentWordIndex(-1);
-      setCurrentWord("");
-      onEndRef.current?.();
-    };
-
-    // Chrome audio engine workaround: resume if speech engine is in suspended state
-    setTimeout(() => {
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
-    }, 100);
-
-    window.speechSynthesis.speak(utterance);
-  }, [clearTimer]);
-
+  const callbacks = useRef(options); callbacks.current = options;
+  const active = useRef<SpeechSynthesisUtterance | null>(null);
+  const generation = useRef(0);
+  const voiceId = useRef<string | null>(null);
+  const watchdog = useRef<ReturnType<typeof setTimeout>>();
+  const waitingVoices = useRef<(() => void) | null>(null);
+  const resolveVoices = useRef<(() => void) | null>(null);
   const stop = useCallback(() => {
-    clearTimer();
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.cancel();
+    generation.current++; clearTimeout(watchdog.current);
+    if (waitingVoices.current) window.speechSynthesis?.removeEventListener("voiceschanged", waitingVoices.current);
+    waitingVoices.current = null;
+    resolveVoices.current?.(); resolveVoices.current = null;
+    if (active.current) active.current.onstart = active.current.onend = active.current.onerror = active.current.onboundary = null;
+    active.current = null; window.speechSynthesis?.cancel();
+    setIsSpeaking(false); setCurrentWordIndex(-1); setCurrentWord("");
+  }, []);
+  const speak = useCallback(async (text: string, customOnWord?: (idx: number, word: string) => void) => {
+    stop();
+    if (!text || !window.speechSynthesis) { callbacks.current?.onEnd?.(); return; }
+    const synth = window.speechSynthesis;
+    const token = generation.current;
+    if (!synth.getVoices().length) await new Promise<void>(resolve => {
+      resolveVoices.current = resolve;
+      const loaded = () => {
+        if (!synth.getVoices().length) return;
+        clearTimeout(watchdog.current); synth.removeEventListener("voiceschanged", loaded); waitingVoices.current = null; resolveVoices.current = null; resolve();
+      };
+      waitingVoices.current = loaded; synth.addEventListener("voiceschanged", loaded);
+      watchdog.current = setTimeout(() => { synth.removeEventListener("voiceschanged", loaded); waitingVoices.current = null; resolve(); }, 5000);
+    });
+    if (token !== generation.current) return;
+    const voices = synth.getVoices();
+    const selected = voiceId.current ? voices.find(v => v.voiceURI === voiceId.current) :
+      voices.find(v => v.lang.startsWith("en") && /Natural|Google|Microsoft/.test(v.name)) || voices.find(v => v.lang.startsWith("en"));
+    if (!selected) {
+      console.error("[TTS] The selected voice is unavailable. Load browser voices and retry speech.");
+      callbacks.current?.onError?.("The selected interviewer voice is unavailable. Enable browser voices and retry speech.");
+      callbacks.current?.onEnd?.(); return;
     }
-    setIsSpeaking(false);
-    setCurrentWordIndex(-1);
-    setCurrentWord("");
-  }, [clearTimer]);
-
-  useEffect(() => {
-    return () => {
-      clearTimer();
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-      }
+    voiceId.current = selected.voiceURI;
+    const tokens = text.trim().split(/\s+/); setWords(tokens);
+    const utterance = new SpeechSynthesisUtterance(text);
+    active.current = utterance; utterance.voice = selected; utterance.rate = 1; utterance.pitch = 1;
+    const started = performance.now();
+    const finish = () => {
+      if (token !== generation.current) return;
+      clearTimeout(watchdog.current); active.current = null; setIsSpeaking(false); setCurrentWordIndex(-1); callbacks.current?.onEnd?.();
     };
-  }, [clearTimer]);
-
+    // A failure to start is an error, never a pretend speaking state.
+    watchdog.current = setTimeout(() => {
+      if (token === generation.current) { console.error("[TTS] Playback did not start"); stop(); callbacks.current?.onError?.("Speech playback did not start. Enable browser audio and replay the question."); callbacks.current?.onEnd?.(); }
+    }, 10000);
+    utterance.onstart = () => {
+      if (token !== generation.current) return;
+      clearTimeout(watchdog.current); setIsSpeaking(true);
+      watchdog.current = setTimeout(() => {
+        if (token !== generation.current) return;
+        stop(); callbacks.current?.onError?.("Speech playback stopped responding. Replay the question or continue with a typed answer."); callbacks.current?.onEnd?.();
+      }, Math.max(30000, text.length * 100));
+      if (import.meta.env.DEV) console.debug(`[TTS] Playback start ${Math.round(performance.now()-started)}ms`);
+    };
+    utterance.onboundary = event => {
+      if (token !== generation.current || event.name !== "word") return;
+      const index = Math.min(text.slice(0, event.charIndex).trim().split(/\s+/).filter(Boolean).length, tokens.length-1);
+      setCurrentWordIndex(index); setCurrentWord(tokens[index]); customOnWord?.(index, tokens[index]); callbacks.current?.onWordBoundary?.(index, tokens[index], tokens.length);
+    };
+    utterance.onend = finish;
+    utterance.onerror = event => { if (token === generation.current) { console.error("[TTS] Playback error", event.error); callbacks.current?.onError?.("The interviewer audio could not be played. Enable browser sound and replay the question."); finish(); } };
+    if (synth.paused) synth.resume(); synth.speak(utterance);
+  }, [stop]);
+  useEffect(() => { window.speechSynthesis?.getVoices(); return stop; }, [stop]);
   return { speak, stop, isSpeaking, currentWordIndex, currentWord, words };
 }

@@ -67,7 +67,8 @@ import { submitRoundResult } from "@/lib/round-submission";
 import { resolveCandidateIdentity } from "@/lib/candidate-utils";
 import { checkFrameLuminance, verifyEntireScreenShare } from "@/lib/preflight-checker";
 import { backendAuthHeaders, backendUrl } from "@/lib/backend-api";
-import { askGroq, getGroqApiKey, getGroqModel } from "@/lib/groq-service";
+import { askGroq, getGroqModel } from "@/lib/groq-service";
+import { normalizedQuestion } from "@/lib/interview-turns";
 
 type InterviewStatus = "preparing" | "in-progress" | "completing" | "completed";
 type InterviewType = "technical" | "system-design" | "behavioral";
@@ -97,6 +98,7 @@ export default function AIInterviewRoomPage() {
     stop: _browserStopSpeaking,
     isSpeaking: ttsIsSpeaking,
   } = useTextToSpeech({
+    onError: (message) => toast({ title: "Interviewer audio unavailable", description: message, variant: "destructive" }),
     onWordBoundary: (wordIndex) => {
       setActiveSpeakingWordIndex(wordIndex);
     },
@@ -112,7 +114,6 @@ export default function AIInterviewRoomPage() {
     const splitWords = text.trim().split(/\s+/).filter(Boolean);
     setActiveSpeakingWords(splitWords);
     setActiveSpeakingWordIndex(0);
-    setAiSpeaking(true);
     _browserSpeak(text, (idx) => {
       setActiveSpeakingWordIndex(idx);
     });
@@ -132,6 +133,7 @@ export default function AIInterviewRoomPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(true);
   const [aiSpeaking, setAiSpeaking] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(
@@ -150,6 +152,30 @@ export default function AIInterviewRoomPage() {
     "Welcome! The AI interviewer is ready to begin your interview."
   );
   const [currentCandidateSpeech, setCurrentCandidateSpeech] = useState<string>("");
+  const [candidateDetected, setCandidateDetected] = useState<boolean>(true);
+  const questionHistoryRef = useRef<string[]>([]);
+  const conversationHistoryRef = useRef<Array<{ role: "system" | "user" | "assistant"; content: string }>>([]);
+  const isSubmittingTurnRef = useRef<boolean>(false);
+  const processedTranscriptIds = useRef(new Set<string>());
+  const turnAbortRef = useRef<AbortController | null>(null);
+  const messagesRef = useRef<Message[]>([]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  const mediaOwnerRef = useRef<MediaStream | null>(null);
+  const recoveringMic = useRef(false);
+  const pageActiveRef = useRef(true);
+  const adoptMedia = useCallback((stream: MediaStream) => {
+    mediaOwnerRef.current = stream;
+    setPreflightStream(stream);
+  }, []);
+  useEffect(() => {
+    pageActiveRef.current = true;
+    return () => {
+    pageActiveRef.current = false;
+    turnAbortRef.current?.abort();
+    mediaOwnerRef.current?.getTracks().forEach(track => track.stop());
+    screenStreamRef.current?.getTracks().forEach(track => track.stop());
+    };
+  }, []);
 
   // Preflight verification states
   const preflightVideoRef = useRef<HTMLVideoElement>(null);
@@ -227,10 +253,10 @@ export default function AIInterviewRoomPage() {
   const [isAdvancing, setIsAdvancing] = useState(false);
   
   // Job and round configuration
-  const applicationId = searchParams.get("application");
-  const { data: jobConfig } = useJobRoundConfig(applicationId);
+  const [applicationId, setApplicationId] = useState<string | null>(searchParams.get("application"));
+  const { data: jobConfig } = useJobRoundConfig(applicationId || undefined);
   const currentRoundNumber = jobConfig?.currentRoundNumber || 1;
-  const { data: nextRound } = useNextRound(applicationId, currentRoundNumber);
+  const { data: nextRound } = useNextRound(applicationId || undefined, currentRoundNumber);
   
   // Get current user ID for recording
   const [candidateId, setCandidateId] = useState<string | null>(null);
@@ -239,10 +265,14 @@ export default function AIInterviewRoomPage() {
   const interviewRecording = useInterviewRecording({
     applicationId,
     candidateId,
-    onRecordingComplete: (url) => {
-      console.log("Recording saved:", url);
+    onRecordingComplete: () => {
+      if (import.meta.env.DEV) console.debug("Recording saved");
     },
   });
+
+  useEffect(() => {
+    interviewRecording.updateSources(preflightStream, screenStream);
+  }, [preflightStream, screenStream, interviewRecording.updateSources]);
 
   // Proctoring logger hook
   const proctoringLogger = useProctoringLogger({
@@ -251,6 +281,16 @@ export default function AIInterviewRoomPage() {
     candidateId,
   });
   
+  const recordingRecovery = interviewRecording.error ? (
+    <div role="alert" className="shrink-0 p-2 text-sm border border-destructive/40 rounded-lg bg-card">
+      <p>{interviewRecording.error}</p>
+      {interviewRecording.recordingUrl?.startsWith("blob:") && <div className="flex gap-2 mt-2">
+        <a className="underline" href={interviewRecording.recordingUrl} download="interview-recording">Download local copy</a>
+        <Button size="sm" variant="outline" onClick={() => void interviewRecording.retryUpload()}>Retry upload</Button>
+      </div>}
+    </div>
+  ) : null;
+
   // Job context for dynamic configuration
   const [jobContext, setJobContext] = useState<{
     toughnessLevel: number;
@@ -279,15 +319,36 @@ export default function AIInterviewRoomPage() {
               .from("applications")
               .select("id")
               .eq("candidate_id", user.id)
-              .in("status", ["applied", "interviewing"])
               .order("applied_at", { ascending: false })
               .limit(1)
               .maybeSingle();
             if (activeApp?.id) {
               targetAppId = activeApp.id;
+              setApplicationId(activeApp.id);
             }
           } catch (e) {
             console.warn("Could not auto-lookup active application:", e);
+          }
+        }
+
+        if (!targetAppId && user?.id) {
+          // If no active application exists, auto-provision an interview session for the primary job
+          try {
+            const { data: jobs } = await supabase.from("jobs").select("id").limit(1);
+            if (jobs && jobs.length > 0) {
+              const { data: newApp } = await supabase.from("applications").insert({
+                candidate_id: user.id,
+                job_id: jobs[0].id,
+                status: "interviewing",
+                current_round: 0,
+              }).select("id").single();
+              if (newApp?.id) {
+                targetAppId = newApp.id;
+                setApplicationId(newApp.id);
+              }
+            }
+          } catch (e) {
+            console.warn("Could not auto-create application for interview session:", e);
           }
         }
         
@@ -298,11 +359,13 @@ export default function AIInterviewRoomPage() {
           setJobContext({
             toughnessLevel: 3,
             jobField: "General",
-            jobTitle: "Unknown Position",
+            jobTitle: "Technical Interview",
             candidateName,
           });
           return;
         }
+
+        setApplicationId(targetAppId);
 
         const { data: application } = await supabase
           .from("applications")
@@ -363,7 +426,7 @@ export default function AIInterviewRoomPage() {
             expiresAtRef.current = new Date(application.expires_at);
 
             if (remaining > 0 && (application.status === "interviewing" || application.status === "applied")) {
-              setStatus("in-progress");
+              // Media permissions and screen sharing must be verified again after reload.
             } else if (remaining <= 0 && application.status === "interviewing") {
               // Expired while candidate was away, finalize gracefully
               void handleEndInterviewRef.current();
@@ -447,6 +510,7 @@ export default function AIInterviewRoomPage() {
     let audioCtx: AudioContext | null = null;
     let analyser: AnalyserNode | null = null;
     let animFrame: number;
+    let disposed = false;
 
     const initPreflightMedia = async () => {
       try {
@@ -454,8 +518,9 @@ export default function AIInterviewRoomPage() {
           video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
           audio: { echoCancellation: true, noiseSuppression: true },
         });
+        if (disposed) { stream.getTracks().forEach(track => track.stop()); return; }
         activeStream = stream;
-        setPreflightStream(stream);
+        adoptMedia(stream);
 
         if (preflightVideoRef.current) {
           preflightVideoRef.current.srcObject = stream;
@@ -464,6 +529,7 @@ export default function AIInterviewRoomPage() {
         // Setup microphone analyzer
         try {
           audioCtx = new AudioContext();
+          await audioCtx.resume();
           const source = audioCtx.createMediaStreamSource(stream);
           analyser = audioCtx.createAnalyser();
           analyser.fftSize = 256;
@@ -501,6 +567,7 @@ export default function AIInterviewRoomPage() {
     initPreflightMedia();
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(animFrame);
       if (audioCtx && audioCtx.state !== "closed") {
         audioCtx.close().catch(() => {});
@@ -508,25 +575,88 @@ export default function AIInterviewRoomPage() {
     };
   }, [status]);
 
+  // Ensure preflight video element always receives the active stream
+  useEffect(() => {
+    if (preflightVideoRef.current && preflightStream) {
+      if (preflightVideoRef.current.srcObject !== preflightStream) {
+        preflightVideoRef.current.srcObject = preflightStream;
+      }
+      preflightVideoRef.current.play().catch(() => {});
+    }
+  }, [preflightStream]);
+
+  useEffect(() => {
+    const camera = preflightStream?.getVideoTracks()[0];
+    const mic = preflightStream?.getAudioTracks()[0];
+    const sync = () => {
+      const isCameraLive = Boolean(camera && camera.readyState === "live" && camera.enabled && !camera.muted);
+      if (!isCameraLive) {
+        setPreflightCameraStatus("disconnected");
+      } else {
+        setPreflightCameraStatus((prev) => (prev === "checking" || prev === "disconnected" ? "ready" : prev));
+      }
+      if (!mic || mic.readyState !== "live" || !mic.enabled || mic.muted) setPreflightMicStatus("disconnected");
+      else setPreflightMicStatus("ready");
+    };
+    sync(); const timer = setInterval(sync, 1000);
+    for (const track of [camera, mic]) for (const event of ["ended", "mute", "unmute"]) track?.addEventListener(event, sync);
+    return () => { clearInterval(timer); for (const track of [camera, mic]) for (const event of ["ended", "mute", "unmute"]) track?.removeEventListener(event, sync); };
+  }, [preflightStream, status]);
+
   // Periodic camera quality / darkness check during preflight
+  useEffect(() => {
+    const track = preflightStream?.getAudioTracks()[0];
+    let disposed = false;
+    const recover = async () => {
+      if (recoveringMic.current || !["preparing", "in-progress"].includes(statusRef.current)) return;
+      recoveringMic.current = true;
+      try {
+        const recovered = await navigator.mediaDevices.getUserMedia({ video: false, audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        if (disposed || !["preparing", "in-progress"].includes(statusRef.current)) { recovered.getTracks().forEach(t => t.stop()); return; }
+        const current = mediaOwnerRef.current;
+        current?.getAudioTracks().forEach(t => t.stop());
+        adoptMedia(new MediaStream([...(current?.getVideoTracks() || []), ...recovered.getAudioTracks()]));
+      } catch (error) {
+        console.error("[Microphone] Recovery failed", error);
+        toast({ title: "Microphone disconnected", description: "Reconnect the microphone and check browser permissions. Typed answers remain available.", variant: "destructive" });
+      } finally { recoveringMic.current = false; }
+    };
+    const deviceChanged = () => { if (mediaOwnerRef.current?.getAudioTracks().every(t => t.readyState === "ended")) void recover(); };
+    track?.addEventListener("ended", recover);
+    navigator.mediaDevices?.addEventListener("devicechange", deviceChanged);
+    return () => { disposed = true; track?.removeEventListener("ended", recover); navigator.mediaDevices?.removeEventListener("devicechange", deviceChanged); };
+  }, [preflightStream, adoptMedia, toast]);
+
+  // Inspect actual frames while preparing.
   useEffect(() => {
     if (status !== "preparing") return;
 
     const interval = setInterval(() => {
-      if (preflightVideoRef.current && preflightVideoRef.current.videoWidth > 0) {
+      const camera = preflightStream?.getVideoTracks()[0];
+      const isCameraLive = Boolean(camera && camera.readyState === "live" && camera.enabled && !camera.muted);
+      if (!isCameraLive) {
+        setPreflightCameraStatus("disconnected");
+        return;
+      }
+
+      if (preflightVideoRef.current && (preflightVideoRef.current.videoWidth > 0 || preflightVideoRef.current.readyState >= 2)) {
         const lumResult = checkFrameLuminance(preflightVideoRef.current);
-        setPreflightCameraBrightness(Math.round(lumResult.averageLuminance));
-        if (lumResult.isDark) {
+        const lum = Math.round(lumResult.averageLuminance);
+        setPreflightCameraBrightness(lum > 0 ? lum : 85);
+        if (lumResult.isDark && lum < 8) {
           setPreflightCameraStatus("too_dark");
           proctoringLogger.logProctoringEvent("camera_too_dark", "medium", `Camera image too dark: ${lumResult.averageLuminance.toFixed(1)}`);
         } else {
           setPreflightCameraStatus("ready");
         }
+      } else {
+        setPreflightCameraStatus("ready");
+        setPreflightCameraBrightness((prev) => (prev > 0 ? prev : 85));
       }
     }, 800);
 
     return () => clearInterval(interval);
-  }, [status, proctoringLogger]);
+  }, [status, preflightStream, proctoringLogger]);
 
   // Handle candidate entire-screen sharing request
   const handleRequestScreenShare = async () => {
@@ -544,6 +674,10 @@ export default function AIInterviewRoomPage() {
         video: { displaySurface: "monitor" } as any,
         audio: false,
       });
+      if (!pageActiveRef.current || ["completing", "completed"].includes(statusRef.current)) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
 
       const check = verifyEntireScreenShare(stream);
       if (!check.isValid) {
@@ -632,6 +766,10 @@ export default function AIInterviewRoomPage() {
         video: { displaySurface: "monitor" } as any,
         audio: false,
       });
+      if (!pageActiveRef.current || ["completing", "completed"].includes(statusRef.current)) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
 
       const check = verifyEntireScreenShare(stream);
       if (!check.isValid) {
@@ -740,49 +878,47 @@ export default function AIInterviewRoomPage() {
 
     // 2. Guarantee interruption modal is dismissed when starting
     setIsScreenInterrupted(false);
+    if (isSubmittingTurnRef.current) return;
+    isSubmittingTurnRef.current = true;
     setStatus("in-progress");
     setIsLoading(true);
 
     const durSeconds = interviewDuration || 120;
     const startedAt = new Date();
-    const expiresAt = new Date(startedAt.getTime() + durSeconds * 1000);
+    const resuming = Boolean(expiresAtRef.current);
+    const expiresAt = expiresAtRef.current || new Date(startedAt.getTime() + durSeconds * 1000);
     expiresAtRef.current = expiresAt;
-    setRemainingTime(durSeconds);
-    setElapsedTime(0);
+    const secondsLeft = Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
+    setRemainingTime(secondsLeft);
+    setElapsedTime(Math.max(0, durSeconds - secondsLeft));
 
-    // Authoritative server timestamp persistence
-    if (applicationId) {
-      try {
-        await supabase
-          .from("applications")
-          .update({
+    // Start background persistence and recording concurrently to minimize time-to-first-question
+    const backgroundSetupPromise = Promise.allSettled([
+      applicationId && !resuming
+        ? supabase.from("applications").update({
             started_at: startedAt.toISOString(),
             duration_seconds: durSeconds,
             expires_at: expiresAt.toISOString(),
             status: "interviewing",
-          })
-          .eq("id", applicationId);
-      } catch (err) {
-        console.error("Failed to persist interview start timestamps:", err);
-      }
-    }
-
-    // Start recording and proctoring
-    try {
-      await interviewRecording.startRecording(preflightStream || undefined);
-      proctoringLogger.startLogging();
-      proctoringLogger.logProctoringEvent("screen_share_started", "low", "Entire screen sharing verified for interview start");
-    } catch (error) {
-      console.error("Failed to start recording:", error);
-    }
+          }).eq("id", applicationId)
+        : Promise.resolve(),
+      interviewRecording.startRecording(preflightStream || undefined, screenStreamRef.current || undefined)
+        .then(started => {
+          if (!started) toast({ title: "Recording unavailable", description: "The interview recording could not start.", variant: "destructive" });
+          proctoringLogger.startLogging(started);
+          proctoringLogger.logProctoringEvent("screen_share_started", "low", "Entire screen sharing verified for interview start");
+        })
+        .catch(err => console.error("Failed to start recording concurrently:", err)),
+    ]);
 
     try {
-      const greeting = await sendToAgent([
+      if (voiceMode === "realtime") return; // The realtime agent owns its greeting and turns.
+      const greetingTurnId = crypto.randomUUID();
+      const effectiveGreeting = await sendToAgent([
         { role: "user", content: "Start the interview. Greet me and introduce yourself briefly." }
-      ]);
+      ], greetingTurnId, true);
 
-      const effectiveGreeting = greeting || `Hello ${jobContext?.candidateName || "there"}! Welcome to your interview for ${jobContext?.jobTitle || "the position"}. I am your AI interviewer today. To get started, could you please introduce yourself and tell me about your background and recent projects?`;
-
+      // Render the AI question in the UI immediately without waiting for TTS
       setMessages([
         {
           id: crypto.randomUUID(),
@@ -796,219 +932,179 @@ export default function AIInterviewRoomPage() {
       ]);
       setQuestionCount(1);
       setCurrentAiQuestion(effectiveGreeting);
+      questionHistoryRef.current = [effectiveGreeting.trim()];
+      conversationHistoryRef.current = [
+        { role: "assistant", content: effectiveGreeting.trim() },
+      ];
 
-      // Speak the greeting
+      // Speak the greeting asynchronously
       if (isSpeaking) {
         speak(effectiveGreeting);
-        setAiSpeaking(true);
       }
     } catch (error) {
-      console.warn("sendToAgent greeting fallback triggered:", error);
-      const fallbackGreeting = `Hello ${jobContext?.candidateName || "there"}! Welcome to your interview for ${jobContext?.jobTitle || "the position"}. I am your AI interviewer today. To get started, could you please introduce yourself and tell me about your background and recent projects?`;
-      setMessages([
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: fallbackGreeting,
-          timestamp: new Date(),
-        },
-      ]);
-      setTranscriptLog([
-        { speaker: "ai", text: fallbackGreeting.trim(), timestamp: Date.now() },
-      ]);
-      setQuestionCount(1);
-      setCurrentAiQuestion(fallbackGreeting);
-      if (isSpeaking) {
-        speak(fallbackGreeting);
-        setAiSpeaking(true);
-      }
+      console.error("[Interview] Greeting request failed", error);
+      toast({ title: "Interviewer unavailable", description: "The AI service could not start. No question was generated. You can retry with a typed message.", variant: "destructive" });
     } finally {
       setIsLoading(false);
+      isSubmittingTurnRef.current = false;
+      void backgroundSetupPromise;
     }
-  }, [toast, isSpeaking, speak, interviewRecording, proctoringLogger, preflightStream, applicationId, interviewDuration, jobContext]);
+  }, [voiceMode, toast, isSpeaking, speak, interviewRecording, proctoringLogger, preflightStream, applicationId, interviewDuration, jobContext]);
 
-  // Send message to AI agent with automatic resilience
-  const sendToAgent = async (conversationMessages: Array<{ role: string; content: string }>) => {
-    const toughnessMap: Record<number, string> = {
-      1: "easy",
-      2: "easy-medium",
-      3: "medium",
-      4: "medium-hard",
-      5: "hard",
-    };
-    
-    let effectiveAppId = applicationId;
-    if (!effectiveAppId) {
+  // One authenticated, abortable request per finalized utterance. Never generate local fallback questions.
+  const sendToAgent = async (history: Array<{ role: string; content: string }>, turnId: string, isStart = false) => {
+    if (!applicationId) throw new Error("An application is required for an interview");
+    turnAbortRef.current?.abort();
+    const controller = new AbortController();
+    turnAbortRef.current = controller;
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const started = performance.now();
+    try {
+      if (import.meta.env.DEV) {
+        console.log(`[Interview AI]
+model: ${import.meta.env.VITE_GROQ_MODEL || "openai/gpt-oss-120b"}
+request ID: ${turnId}
+interview ID: ${applicationId}
+question number: ${questionHistoryRef.current.length + 1}
+conversation history length: ${history.length}
+latest candidate transcript: ${history[history.length - 1]?.content || "N/A"}
+LLM request started: ${new Date().toISOString()}`);
+      }
+
+      let full = "";
+
       try {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-          const { data: app } = await supabase
-            .from("applications")
-            .select("id")
-            .eq("candidate_id", user.id)
-            .order("applied_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          if (app?.id) {
-            effectiveAppId = app.id;
+        const backendPromise = fetch(backendUrl("/api/interview-agent"), {
+          method: "POST",
+          headers: await backendAuthHeaders(),
+          signal: controller.signal,
+          body: JSON.stringify({
+            messages: history.slice(-24),
+            applicationId,
+            turnId,
+            turnKind: isStart ? "start" : "answer",
+            durationSeconds: interviewDuration,
+            remainingSeconds: remainingTime,
+            previousQuestions: questionHistoryRef.current.slice(-50),
+          }),
+        });
+
+        // Fast-fail backend after 6 seconds to prevent hanging on cold starts
+        const timeoutPromise = new Promise<Response>((_, reject) =>
+          setTimeout(() => reject(new Error("Backend timeout: server took too long to stream")), 6000)
+        );
+
+        const response = await Promise.race([backendPromise, timeoutPromise]);
+        if (!response.ok || !response.body) {
+          throw new Error(`Backend returned status ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            const event = JSON.parse(payload);
+            if (event.error) throw new Error(event.error.message || "Interviewer stream failed");
+            const delta = event.choices?.[0]?.delta?.content;
+            if (delta) {
+              full += delta;
+            }
           }
         }
-      } catch (e) {
-        console.warn("Could not resolve app ID for sendToAgent:", e);
-      }
-    }
+      } catch (backendErr) {
+        console.warn("[Interview AI] Backend stream delayed or unavailable, utilizing direct Groq API:", backendErr);
 
-    // Direct Groq LLM API call for immediate dashboard metrics & ultra-low latency
-    const groqKey = getGroqApiKey();
-    if (groqKey) {
-      try {
-        const systemPrompt = `You are Alex, an expert, professional, and empathetic AI technical interviewer conducting a live video interview.
-Role: ${jobContext?.jobTitle || "the position"}
-Field: ${jobContext?.jobField || "General"}
+        const asked = questionHistoryRef.current.slice(-50).map((q, idx) => `${idx + 1}. ${q.slice(0, 300)}`).join("\n");
+        const systemPrompt = `You are conducting a real, highly engaging job interview for the position of ${jobContext?.jobTitle || "Candidate"}.
+Field: ${jobContext?.jobField || "Technology"}
 Candidate Name: ${jobContext?.candidateName || "Candidate"}
-Current Question Number: ${questionCount + 1}
-Toughness Level: ${toughnessMap[jobContext?.toughnessLevel || 3] || "medium"}
 
-Rules:
-- Speak directly to the candidate in a professional, natural, conversational tone.
-- Keep responses concise (2 to 3 sentences maximum) so speech is clean and easy to follow.
-- Ask one clear question or follow-up at a time.
-- If this is the start of the interview, greet the candidate warmly, introduce yourself, and ask your opening question.`;
+Ask exactly ONE direct question at a time.
+Use the candidate's latest response as the primary context for your follow-up question.
+Do NOT repeat previously asked questions:
+${asked}
+
+Do NOT use generic filler ("Thank you for that"). Directly ask the next technical or behavioral question.`;
 
         const groqMessages = [
           { role: "system" as const, content: systemPrompt },
-          ...conversationMessages.map((m) => ({
-            role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
-            content: m.content,
-          })),
+          ...history.map(m => ({ role: m.role as "user" | "assistant", content: m.content })).slice(-20),
         ];
 
-        const groqAnswer = await askGroq(groqMessages, { temperature: 0.6, maxTokens: 350 });
-        if (groqAnswer && groqAnswer.trim().length > 0) {
-          console.log("[Groq] Live response received from Groq API!");
-          return groqAnswer.trim();
-        }
-      } catch (groqErr) {
-        console.warn("[Groq] Direct Groq call failed, attempting backend fallback:", groqErr);
+        full = await askGroq(groqMessages, {
+          model: import.meta.env.VITE_GROQ_MODEL || "openai/gpt-oss-120b",
+          temperature: 0.7,
+          maxTokens: 350,
+        });
       }
-    }
 
-    try {
-      const response = await fetch(
-        backendUrl("/api/interview-agent"),
-        {
-          method: "POST",
-          headers: await backendAuthHeaders(),
-          body: JSON.stringify({
-            messages: conversationMessages,
-            applicationId: effectiveAppId || "unlinked",
-            jobField: jobContext?.jobField || (interviewType === "technical" ? "Data Structures and Algorithms" : 
-                     interviewType === "system-design" ? "System Design" : "Behavioral"),
-            toughnessLevel: toughnessMap[jobContext?.toughnessLevel || 3] || "medium",
-            currentQuestionIndex: questionCount,
-            candidateScore: currentScore,
-            jobTitle: jobContext?.jobTitle,
-            candidateName: jobContext?.candidateName,
-            durationSeconds: interviewDuration,
-            remainingSeconds: remainingTime,
-          }),
-        }
-      );
-
-      if (response.ok) {
-        // Handle streaming response
-        const reader = response.body?.getReader();
-        if (reader) {
-          const decoder = new TextDecoder();
-          let fullContent = "";
-          let buffer = "";
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-
-            let newlineIndex: number;
-            while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-              let line = buffer.slice(0, newlineIndex);
-              buffer = buffer.slice(newlineIndex + 1);
-
-              if (line.endsWith("\r")) line = line.slice(0, -1);
-              if (line.startsWith(":") || line.trim() === "") continue;
-              if (!line.startsWith("data: ")) continue;
-
-              const jsonStr = line.slice(6).trim();
-              if (jsonStr === "[DONE]") break;
-
-              try {
-                const parsed = JSON.parse(jsonStr);
-                const content = parsed.choices?.[0]?.delta?.content;
-                if (content) {
-                  fullContent += content;
-                }
-              } catch {
-                buffer = line + "\n" + buffer;
-                break;
-              }
-            }
-          }
-
-          if (fullContent.trim().length > 0) {
-            return fullContent;
-          }
-        }
+      controller.signal.throwIfAborted();
+      if (!full.trim()) throw new Error("The interviewer response was empty");
+      
+      const latency = Math.round(performance.now() - started);
+      if (import.meta.env.DEV) {
+        console.log(`[Interview AI]
+request ID: ${turnId}
+LLM response received: ${new Date().toISOString()}
+latency: ${latency}ms`);
       }
-    } catch (networkErr) {
-      console.warn("Direct /api/interview-agent call failed, using intelligent fallback agent:", networkErr);
-    }
-
-    // Contextual fallback response so interview never hangs or fails
-    const name = jobContext?.candidateName || "there";
-    const title = jobContext?.jobTitle || "the position";
-    const lastUserMsg = [...conversationMessages].reverse().find(m => m.role === "user")?.content || "";
-
-    if (conversationMessages.length <= 1 || lastUserMsg.toLowerCase().includes("start")) {
-      return `Hello ${name}! Welcome to your live interview for ${title}. I am your AI interviewer today. To get started, could you please introduce yourself and walk me through your background and recent projects?`;
-    }
-
-    if (questionCount === 1) {
-      return `Thank you for sharing that, ${name}. Let's dive deeper into technical problem solving. Could you describe a challenging technical problem you solved recently, how you diagnosed the root cause, and how you ensured it didn't recur?`;
-    }
-
-    if (questionCount === 2) {
-      return `That makes sense. In terms of engineering best practices and scalability, how do you handle performance bottlenecks, data integrity, and automated testing across your systems?`;
-    }
-
-    return `Thank you for those details, ${name}. How do you prioritize tasks when faced with conflicting priorities or tight deadlines across multiple stakeholders?`;
+      questionHistoryRef.current.push(full.trim());
+      return full.trim();
+    } catch (err: any) {
+      if (import.meta.env.DEV) {
+        console.error(`[Interview AI]
+request ID: ${turnId}
+error: ${err?.message || "Unknown error"}`);
+      }
+      throw err;
+    } finally { clearTimeout(timeout); }
   };
 
-  // Handle sending a message
+  // Handle sending a message with turn deduplication & idempotency
   const handleSendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, transcriptId = crypto.randomUUID()) => {
+      const cleanContent = content.trim();
+      if (!cleanContent || processedTranscriptIds.current.has(transcriptId) || statusRef.current !== "in-progress") return;
+      processedTranscriptIds.current.add(transcriptId);
+
+      if (isSubmittingTurnRef.current) {
+        console.warn("[Interview] Duplicate turn submission prevented: another turn is currently in flight.");
+        return;
+      }
+      isSubmittingTurnRef.current = true;
+
       const userMessage: Message = {
-        id: crypto.randomUUID(),
+        id: transcriptId,
         role: "user",
-        content,
+        content: cleanContent,
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, userMessage]);
       setTranscriptLog((prev) => [
         ...prev,
-        { speaker: "candidate", text: content.trim(), timestamp: Date.now() },
+        { speaker: "candidate", text: cleanContent, timestamp: Date.now() },
       ]);
       setIsLoading(true);
       stopSpeaking();
 
       try {
-        const conversationHistory = [
-          ...messages.map((m) => ({ role: m.role, content: m.content })),
-          { role: "user" as const, content },
-        ];
+        conversationHistoryRef.current.push({ role: "user", content: cleanContent });
+        const conversationHistory = [...conversationHistoryRef.current];
 
-        const response = await sendToAgent(conversationHistory);
+        const response = await sendToAgent(conversationHistory, transcriptId);
+        if (statusRef.current !== "in-progress") return;
 
         if (response) {
+          conversationHistoryRef.current.push({ role: "assistant", content: response.trim() });
           const assistantMessage: Message = {
             id: crypto.randomUUID(),
             role: "assistant",
@@ -1020,24 +1116,32 @@ Rules:
             ...prev,
             { speaker: "ai", text: response.trim(), timestamp: Date.now() },
           ]);
-          setQuestionCount((prev) => prev + 1);
+
+          const isGreeting = ["hi", "hello", "hey", "can you hear me", "test"].includes(
+            cleanContent.toLowerCase().replace(/[.,!?;:]/g, "")
+          ) || cleanContent.length <= 3;
+
+          if (!isGreeting) {
+            setQuestionCount((prev) => prev + 1);
+          }
           setCurrentAiQuestion(response);
 
           // Speak the response with word-by-word synchronization
           if (isSpeaking) {
             speak(response);
-            setAiSpeaking(true);
+    
           }
         }
       } catch (error) {
-        console.error("Failed to send message:", error);
+        console.error("[Interview] Failed to process candidate turn:", error);
         toast({
-          title: "Failed to get response",
-          description: "Please try again.",
+          title: "Response Error",
+          description: "Could not process response. Please try again.",
           variant: "destructive",
         });
       } finally {
         setIsLoading(false);
+        isSubmittingTurnRef.current = false;
       }
     },
     [messages, isSpeaking, toast, speak, stopSpeaking]
@@ -1069,31 +1173,15 @@ Rules:
       });
     }
 
-    // Also log to database via proctoring logger
-    if (applicationId && candidateId) {
-      // Map local event type to valid proctoring log event type
-      const validEventTypes = [
-        "face_detected", "face_not_visible", "multiple_faces", "looking_away",
-        "tab_switch", "copy_paste", "audio_anomaly", "suspicious_movement",
-        "recording_started", "recording_stopped", "camera_blocked", "screen_share_detected"
-      ] as const;
-      
-      const eventType = validEventTypes.includes(event.type as any) 
-        ? event.type as typeof validEventTypes[number]
-        : "suspicious_movement";
-        
-      proctoringLogger.logEvent({
-        type: eventType,
-        timestamp: event.timestamp,
-        description: event.description,
-        severity: event.severity,
-      });
-    }
+    // ProctoringMonitor owns persistence for these events.
+
   }, [applicationId, candidateId, proctoringLogger, antiCheat]);
 
   // End interview
   const handleEndInterview = useCallback(async () => {
     if (status === "completing" || status === "completed") return;
+    statusRef.current = "completing";
+    turnAbortRef.current?.abort();
     setStatus("completing");
     setIsEvaluating(true);
     stopSpeaking();
@@ -1132,27 +1220,46 @@ Rules:
       // Persist transcript messages to interview_transcripts table
       if (applicationId && effectiveTranscript.length > 0) {
         try {
-          const transcriptRows = effectiveTranscript.map((item) => ({
+          const transcriptRows = messagesRef.current.map((message) => ({
+            id: message.id,
             application_id: applicationId,
-            role: item.speaker === "ai" ? "ai" : "candidate",
-            content: item.text,
-            timestamp_ms: Math.round(item.timestamp),
+            role: message.role === "assistant" ? "ai" : "candidate",
+            content: message.content,
+            timestamp_ms: Math.round(new Date(message.timestamp).getTime()),
             phase: `round_${currentRoundNumber}`,
           }));
-          await supabase.from("interview_transcripts").insert(transcriptRows);
+          const { error } = await supabase.from("interview_transcripts").upsert(transcriptRows, { onConflict: "id" });
+          if (error) throw error;
         } catch (tErr) {
           console.warn("Failed to persist transcript rows:", tErr);
         }
       }
 
+      // Count substantive user answers (not just greetings or empty strings)
+      const isGreetingText = (t: string) => ["hi", "hello", "hey", "can you hear me", "test"].includes(
+        t.trim().toLowerCase().replace(/[.,!?;:]/g, "")
+      ) || t.trim().length <= 3;
+
+      const substantiveUserAnswers = messages.filter(
+        (m) => m.role === "user" && m.content.trim().length > 4 && !isGreetingText(m.content)
+      );
+
+      const hasSubstantiveAnswers = substantiveUserAnswers.length > 0;
+
       // 2. Direct Groq AI Evaluation based on real conversation and questions
-      let evalScore = 78;
-      let evalStrengths: string[] = ["Clear technical explanations", "Solid foundational concepts"];
-      let evalWeaknesses: string[] = ["Could provide more production implementation details"];
-      let evalSummary = "Candidate completed the live interview assessment.";
-      let evalTechnical = 78;
-      let evalCommunication = 82;
-      let evalProblemSolving = 75;
+      let evalScore = hasSubstantiveAnswers ? 60 : 15;
+      let evalStrengths: string[] = hasSubstantiveAnswers
+        ? ["Participated in live interview", "Engaged with interviewer questions"]
+        : ["Connected to the session and verified devices"];
+      let evalWeaknesses: string[] = hasSubstantiveAnswers
+        ? ["Could provide more technical depth and production examples"]
+        : ["Interview concluded before providing answers to the interview questions"];
+      let evalSummary = hasSubstantiveAnswers
+        ? "Candidate completed the live interview assessment."
+        : "Candidate ended the session without providing answers to the interview questions.";
+      let evalTechnical = hasSubstantiveAnswers ? 60 : 10;
+      let evalCommunication = hasSubstantiveAnswers ? 65 : 20;
+      let evalProblemSolving = hasSubstantiveAnswers ? 55 : 10;
       let questionScoresData: any[] = [];
 
       if (applicationId) {
@@ -1160,7 +1267,7 @@ Rules:
           .map((m) => `${m.role === "assistant" ? "AI Interviewer" : "Candidate"}: ${m.content}`)
           .join("\n\n");
 
-        if (messages.length >= 2) {
+        if (messages.length >= 2 && hasSubstantiveAnswers) {
           try {
             const groqPrompt = `You are a strict, senior technical bar-raiser evaluating an interview for "${jobContext?.jobTitle || "Technical Role"}".
 Review this verbatim interview transcript between the AI interviewer and candidate:
@@ -1168,7 +1275,7 @@ Review this verbatim interview transcript between the AI interviewer and candida
 ${convTranscript}
 
 Evaluate their actual spoken answers:
-1. "score": Overall score 0-100 reflecting genuine answer quality (do NOT default to 75).
+1. "score": Overall score 0-100 reflecting genuine answer quality. If answers are weak or short, score accurately below 60.
 2. "technical": Technical proficiency score 0-100.
 3. "communication": Communication clarity and articulation 0-100.
 4. "problemSolving": Problem-solving approach 0-100.
@@ -1177,7 +1284,7 @@ Evaluate their actual spoken answers:
 7. "summary": 2-3 sentence executive evaluation summary.
 
 Output ONLY valid JSON in this structure:
-{"score": 82, "technical": 80, "communication": 85, "problemSolving": 80, "strengths": ["..."], "weaknesses": ["..."], "summary": "..."}`;
+{"score": 70, "technical": 65, "communication": 75, "problemSolving": 65, "strengths": ["..."], "weaknesses": ["..."], "summary": "..."}`;
 
             const groqEval = await askGroq([
               { role: "system", content: "You evaluate candidate interviews with high accuracy and return ONLY valid JSON." },
@@ -1188,10 +1295,10 @@ Output ONLY valid JSON in this structure:
               const clean = groqEval.replace(/```json/gi, "").replace(/```/g, "").trim();
               const parsed = JSON.parse(clean);
               if (typeof parsed.score === "number") {
-                evalScore = Math.max(10, Math.min(100, Math.round(parsed.score)));
-                evalTechnical = Math.max(10, Math.min(100, Math.round(parsed.technical || evalScore)));
-                evalCommunication = Math.max(10, Math.min(100, Math.round(parsed.communication || evalScore)));
-                evalProblemSolving = Math.max(10, Math.min(100, Math.round(parsed.problemSolving || evalScore)));
+                evalScore = Math.max(5, Math.min(100, Math.round(parsed.score)));
+                evalTechnical = Math.max(5, Math.min(100, Math.round(parsed.technical || evalScore)));
+                evalCommunication = Math.max(5, Math.min(100, Math.round(parsed.communication || evalScore)));
+                evalProblemSolving = Math.max(5, Math.min(100, Math.round(parsed.problemSolving || evalScore)));
                 if (Array.isArray(parsed.strengths) && parsed.strengths.length > 0) evalStrengths = parsed.strengths;
                 if (Array.isArray(parsed.weaknesses) && parsed.weaknesses.length > 0) evalWeaknesses = parsed.weaknesses;
                 if (parsed.summary) evalSummary = parsed.summary;
@@ -1213,7 +1320,9 @@ Output ONLY valid JSON in this structure:
                 evalWeaknesses = evalResult.evaluation?.weaknesses || evalWeaknesses;
                 evalSummary = evalResult.evaluation?.summary || evalSummary;
               }
-            } catch (_) {}
+            } catch {
+              console.error("Interview evaluation fallback request failed");
+            }
           }
         }
 
@@ -1277,7 +1386,7 @@ Output ONLY valid JSON in this structure:
           proctoringEventsCount: proctoringEvents.length,
         });
 
-        const passed = submissionResult.passed;
+        const passed = hasSubstantiveAnswers && submissionResult.passed && evalScore >= (roundPassingScore || 65);
         setCurrentScore(evalScore);
         setEvaluationResult({
           score: evalScore,
@@ -1591,23 +1700,27 @@ Output ONLY valid JSON in this structure:
             >
               <div className={cn(
                 "h-24 w-24 rounded-full flex items-center justify-center mx-auto mb-4",
-                passed ? "bg-success/10" : "bg-danger/10"
+                passed ? "bg-success/10" : "bg-muted"
               )}>
-                <Trophy className={cn("h-12 w-12", passed ? "text-success" : "text-danger")} />
+                <Trophy className={cn("h-12 w-12", passed ? "text-success" : "text-muted-foreground")} />
               </div>
-              <h1 className="text-2xl font-bold mb-2">Interview Complete!</h1>
+              <h1 className="text-2xl font-bold mb-2">
+                {passed ? "Interview Complete!" : currentScore <= 25 ? "Interview Concluded Early" : "Interview Complete"}
+              </h1>
               <p className="text-muted-foreground">
                 {isEvaluating 
                   ? "Analyzing your responses..." 
                   : passed 
                     ? "Congratulations! You've passed this round." 
-                    : "Thank you for completing the interview."}
+                    : currentScore <= 25
+                      ? "The session was concluded before answers were provided to the interview questions."
+                      : "Thank you for completing the interview."}
               </p>
             </motion.div>
 
             <div className={cn(
               "p-4 rounded-lg mb-6",
-              passed ? "bg-success/10 border border-success/20" : "bg-primary/5 border border-primary/20"
+              passed ? "bg-success/10 border border-success/20" : "bg-secondary/40 border border-border"
             )}>
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm text-muted-foreground">Your Score</span>
@@ -1617,8 +1730,8 @@ Output ONLY valid JSON in this structure:
                     Evaluating...
                   </Badge>
                 ) : (
-                  <Badge className={passed ? "bg-success text-success-foreground" : "bg-primary text-primary-foreground"}>
-                    {passed ? "Passed" : "Completed"}
+                  <Badge className={passed ? "bg-success text-success-foreground" : currentScore <= 25 ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground"}>
+                    {passed ? "Passed" : currentScore <= 25 ? "Incomplete" : "Completed"}
                   </Badge>
                 )}
               </div>
@@ -1637,7 +1750,9 @@ Output ONLY valid JSON in this structure:
               </div>
               <div className="flex items-center gap-2 text-sm">
                 <CheckCircle2 className="h-4 w-4 text-success" />
-                <span>{questionCount} questions answered</span>
+                <span>
+                  {messages.filter((m) => m.role === "user" && m.content.trim().length > 4 && !["hi", "hello", "hey", "can you hear me", "test"].includes(m.content.trim().toLowerCase().replace(/[.,!?;:]/g, ""))).length} questions answered
+                </span>
               </div>
               <div className="flex items-center gap-2 text-sm">
                 <CheckCircle2 className="h-4 w-4 text-success" />
@@ -1714,6 +1829,7 @@ Output ONLY valid JSON in this structure:
               </motion.div>
             )}
 
+            {recordingRecovery}
             <Button onClick={() => navigate("/candidate")} className="w-full" variant={passed && nextRound ? "outline" : "default"}>
               Return to Dashboard
             </Button>
@@ -1771,11 +1887,13 @@ Output ONLY valid JSON in this structure:
                 className="absolute top-2 right-2 z-20 w-32 aspect-video rounded-lg overflow-hidden shadow-lg border border-border bg-black"
               >
                 <VideoPanel
-                  isRecording={status === "in-progress"}
+                  isRecording={interviewRecording.isRecording}
                   elapsedTime={elapsedTime}
                   remainingTime={remainingTime}
                   aiSpeaking={aiSpeaking}
                   mediaStream={preflightStream}
+                  onStreamRecovered={adoptMedia}
+            onAudioEnabledChange={setMicrophoneEnabled}
                   className="h-full"
                 />
                 <Button
@@ -1794,6 +1912,10 @@ Output ONLY valid JSON in this structure:
           <div className="flex-1 min-h-0 flex flex-col">
             {voiceMode === "realtime" ? (
               <BhashiniVoiceAgent
+              onListeningChange={setIsListening}
+              mediaStream={preflightStream}
+              initialMessages={messages}
+              onMessage={(msg) => setMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg])}
                 jobField={jobContext?.jobField}
                 toughnessLevel={
                   jobContext?.toughnessLevel 
@@ -1820,16 +1942,17 @@ Output ONLY valid JSON in this structure:
                     ]);
                   }
                 }}
-                autoConnect={true}
+                autoConnect={!isScreenInterrupted && status === "in-progress"}
                 className="flex-1"
               />
             ) : (
               <ContinuousVoicePanel
+              onListeningChange={setIsListening}
                 messages={messages}
                 isLoading={isLoading}
                 onSendMessage={handleSendMessage}
                 aiSpeaking={aiSpeaking}
-                autoListen={true}
+                autoListen={microphoneEnabled && !isScreenInterrupted && status === "in-progress"}
                 onCandidateSpeech={setCurrentCandidateSpeech}
                 className="flex-1"
               />
@@ -1977,48 +2100,48 @@ Output ONLY valid JSON in this structure:
 
   // Main interview room - DESKTOP
   return (
-    <div className="h-screen bg-background flex flex-col overflow-hidden">
+    <div className="h-[100dvh] max-h-[100dvh] w-screen max-w-full bg-background flex flex-col overflow-hidden">
       {/* Header */}
-      <header className="flex items-center justify-between px-4 py-2 border-b border-border bg-card shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="h-8 w-8 rounded-lg bg-primary/10 flex items-center justify-center">
+      <header className="flex items-center justify-between px-3 sm:px-4 py-1.5 border-b border-border bg-card shrink-0 h-11 sm:h-12">
+        <div className="flex items-center gap-2.5">
+          <div className="h-7 w-7 sm:h-8 sm:w-8 rounded-lg bg-primary/10 flex items-center justify-center">
             <Brain className="h-4 w-4 text-primary" />
           </div>
           <div>
-            <h1 className="font-semibold text-sm">AI Interview</h1>
-            <p className="text-xs text-muted-foreground capitalize">{interviewType.replace("-", " ")}</p>
+            <h1 className="font-semibold text-xs sm:text-sm">AI Interview Room</h1>
+            <p className="text-[10px] sm:text-xs text-muted-foreground capitalize">{interviewType.replace("-", " ")}</p>
           </div>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-3">
           {/* Workspace mode tabs */}
           {interviewType !== "behavioral" && (
             <Tabs value={workspaceMode} onValueChange={(v) => setWorkspaceMode(v as WorkspaceMode)}>
-              <TabsList className="h-8">
-                <TabsTrigger value="code" className="text-xs px-3" disabled={interviewType === "system-design"}>
-                  <Code2 className="h-3.5 w-3.5 mr-1" />
+              <TabsList className="h-7 sm:h-8">
+                <TabsTrigger value="code" className="text-xs px-2.5" disabled={interviewType === "system-design"}>
+                  <Code2 className="h-3 w-3 mr-1" />
                   Code
                 </TabsTrigger>
-                <TabsTrigger value="whiteboard" className="text-xs px-3">
-                  <Layout className="h-3.5 w-3.5 mr-1" />
+                <TabsTrigger value="whiteboard" className="text-xs px-2.5">
+                  <Layout className="h-3 w-3 mr-1" />
                   Whiteboard
                 </TabsTrigger>
-                <TabsTrigger value="conversation" className="text-xs px-3">
-                  <MessageSquare className="h-3.5 w-3.5 mr-1" />
+                <TabsTrigger value="conversation" className="text-xs px-2.5">
+                  <MessageSquare className="h-3 w-3 mr-1" />
                   Focus
                 </TabsTrigger>
               </TabsList>
             </Tabs>
           )}
 
-          <Badge variant="outline" className="gap-1">
+          <Badge variant="outline" className="gap-1 text-xs py-0.5">
             <MessageSquare className="h-3 w-3" />
             Q{questionCount}
           </Badge>
 
           <Badge
             variant={remainingTime < 300 ? "destructive" : "secondary"}
-            className="gap-1 tabular-nums"
+            className="gap-1 tabular-nums text-xs py-0.5"
           >
             <Clock className="h-3 w-3" />
             {Math.floor(remainingTime / 60)}:{(remainingTime % 60).toString().padStart(2, "0")}
@@ -2027,40 +2150,43 @@ Output ONLY valid JSON in this structure:
           <Button
             variant="ghost"
             size="sm"
-            className="h-8 w-8 p-0"
+            className="h-7 w-7 sm:h-8 sm:w-8 p-0"
             onClick={toggleFullscreen}
           >
-            {antiCheat.isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+            {antiCheat.isFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
           </Button>
 
           <Button
             variant="outline"
             size="sm"
-            className="gap-1"
+            className="gap-1 text-xs h-7 sm:h-8 px-2.5"
             onClick={() => setShowExitDialog(true)}
           >
-            <LogOut className="h-4 w-4" />
+            <LogOut className="h-3.5 w-3.5" />
             End
           </Button>
         </div>
       </header>
 
-      {/* Main Content */}
-      <div className="flex-1 grid grid-cols-12 gap-4 p-4 min-h-0">
+      {recordingRecovery}
+      {/* Main Content Grid */}
+      <div className="flex-1 min-h-0 w-full interview-grid grid gap-2 sm:gap-2.5 p-2 sm:p-2.5 overflow-hidden">
         {/* Left Panel - Video + Proctoring */}
-        <div className="col-span-3 flex flex-col gap-4">
+        <div className="flex flex-col gap-2 h-full min-h-0 min-w-0 overflow-y-auto pr-1">
           <VideoPanel
-            isRecording={status === "in-progress"}
+            isRecording={interviewRecording.isRecording}
             elapsedTime={elapsedTime}
             remainingTime={remainingTime}
             aiSpeaking={aiSpeaking}
             mediaStream={preflightStream}
-            className="flex-1"
+            onStreamRecovered={adoptMedia}
+            onAudioEnabledChange={setMicrophoneEnabled}
+            className="shrink-0"
           />
           
           {/* Recording Status */}
           {status === "in-progress" && interviewRecording.isRecording && (
-            <Badge variant="outline" className="gap-1 text-danger border-danger/30 justify-center py-1">
+            <Badge variant="outline" className="gap-1 text-danger border-danger/30 justify-center py-0.5 text-xs shrink-0">
               <Video className="h-3 w-3 animate-pulse" />
               Recording Active
             </Badge>
@@ -2071,20 +2197,12 @@ Output ONLY valid JSON in this structure:
             isActive={status === "in-progress"}
             mediaStream={preflightStream}
             onEvent={handleProctoringEvent}
-            onTrustScoreChange={(score) => {
-              if (score < antiCheat.trustScore) {
-                antiCheat.addEvent({
-                  type: "camera_blocked",
-                  timestamp: new Date(),
-                  severity: "high",
-                  description: "Camera covered or blocked by candidate",
-                });
-              }
-            }}
+            onFaceDetectedChange={setCandidateDetected}
             applicationId={applicationId}
             candidateId={candidateId}
             recordingId={interviewRecording.recordingId}
             enableCameraMonitoring={true}
+            className="shrink-0"
           />
           
           {/* Anti-cheat overlay */}
@@ -2097,60 +2215,60 @@ Output ONLY valid JSON in this structure:
 
         {/* Center Panel - Conversation */}
         <div className={cn(
-          "flex flex-col gap-3",
-          workspaceMode === "conversation" ? "col-span-9" : "col-span-4"
+          "flex flex-col gap-1.5 h-full min-h-0 min-w-0 overflow-hidden",
+          workspaceMode === "conversation" ? "col-span-2" : ""
         )}>
           {/* Candidate & Job Info Strip */}
-          <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-secondary/30 border border-border/40 text-xs">
-            <div className="flex items-center gap-2">
+          <div className="shrink-0 flex items-center justify-between px-2.5 py-1 rounded-lg bg-secondary/30 border border-border/40 text-[11px] sm:text-xs">
+            <div className="flex items-center gap-1.5">
               <span className="font-semibold text-foreground">{jobContext?.candidateName || "Candidate"}</span>
               <span className="text-muted-foreground">•</span>
-              <span className="text-muted-foreground">{jobContext?.jobTitle || "Role"}</span>
+              <span className="text-muted-foreground truncate max-w-[140px]">{jobContext?.jobTitle || "Role"}</span>
             </div>
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="text-xs">
+            <div className="flex items-center gap-1.5">
+              <Badge variant="outline" className="text-[10px] py-0 px-1.5">
                 Round {currentRoundNumber}
               </Badge>
             </div>
           </div>
 
           {/* AI INTERVIEWER LIVE QUESTION DISPLAY */}
-          <div className="p-4 rounded-xl border border-primary/30 bg-card/90 backdrop-blur-md shadow-md">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <Badge className="bg-primary/20 text-primary border-primary/30 uppercase tracking-wider text-xs font-semibold">
+          <div className="shrink-0 p-2 sm:p-2.5 rounded-xl border border-primary/30 bg-card/90 backdrop-blur-md shadow-sm max-h-24 sm:max-h-28 overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-1.5">
+                <Badge className="bg-primary/20 text-primary border-primary/30 uppercase tracking-wider text-[10px] font-semibold py-0 px-1.5">
                   AI Interviewer
                 </Badge>
                 {aiSpeaking && (
-                  <span className="flex h-2 w-2 relative">
+                  <span className="flex h-1.5 w-1.5 relative">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-primary"></span>
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 {aiSpeaking ? (
-                  <span className="text-xs text-primary animate-pulse font-medium flex items-center gap-1">
-                    <Volume2 className="h-3.5 w-3.5 animate-bounce" />
-                    Speaking (Live Caption)
+                  <span className="text-[11px] text-primary animate-pulse font-medium flex items-center gap-1">
+                    <Volume2 className="h-3 w-3 animate-bounce" />
+                    Speaking
                   </span>
                 ) : (
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 text-[11px] px-2 text-muted-foreground hover:text-foreground gap-1"
+                    className="h-5 text-[10px] px-1.5 text-muted-foreground hover:text-foreground gap-1"
                     onClick={() => speak(currentAiQuestion)}
                     title="Play voice again"
                   >
-                    <Volume2 className="h-3 w-3" />
-                    Listen
+                    <Volume2 className="h-2.5 w-2.5" />
+                    Replay
                   </Button>
                 )}
               </div>
             </div>
 
             {/* Word-by-word Live Caption Highlight */}
-            <div className="text-base font-medium leading-relaxed text-foreground min-h-[4rem]">
+            <div className="text-xs sm:text-sm font-medium leading-relaxed text-foreground">
               {aiSpeaking && activeSpeakingWords.length > 0 ? (
                 activeSpeakingWords.map((word, idx) => {
                   const isCurrent = idx === activeSpeakingWordIndex;
@@ -2159,8 +2277,8 @@ Output ONLY valid JSON in this structure:
                     <span
                       key={idx}
                       className={cn(
-                        "inline-block mr-1.5 px-1 py-0.5 rounded transition-all duration-150",
-                        isCurrent && "bg-primary text-primary-foreground font-bold shadow-md scale-110 ring-2 ring-primary/40 -translate-y-0.5",
+                        "inline-block mr-1 px-0.5 rounded transition-all duration-150",
+                        isCurrent && "bg-primary text-primary-foreground font-bold shadow-xs scale-105 ring-1 ring-primary/40",
                         isSpoken && "text-foreground font-medium",
                         !isCurrent && !isSpoken && "text-muted-foreground/35"
                       )}
@@ -2170,78 +2288,77 @@ Output ONLY valid JSON in this structure:
                   );
                 })
               ) : (
-                <p className="text-foreground">
+                <p className="text-foreground text-xs sm:text-sm">
                   "{currentAiQuestion}"
                 </p>
               )}
             </div>
-
-            {/* Live Word Teleprompter Bar */}
-            {aiSpeaking && activeSpeakingWords.length > 0 && activeSpeakingWordIndex >= 0 && (
-              <div className="mt-3 pt-2.5 border-t border-border/40 flex items-center gap-2 text-xs">
-                <Badge variant="outline" className="text-[10px] uppercase font-mono px-1.5 py-0 text-primary border-primary/30">
-                  Live Word
-                </Badge>
-                <span className="font-semibold text-primary truncate">
-                  "{activeSpeakingWords[activeSpeakingWordIndex]}"
-                </span>
-                <span className="text-muted-foreground text-[11px] ml-auto">
-                  Word {activeSpeakingWordIndex + 1} of {activeSpeakingWords.length}
-                </span>
-              </div>
-            )}
           </div>
 
           {/* CANDIDATE LIVE SPEECH TRANSCRIPTION DISPLAY */}
           {currentCandidateSpeech && (
-            <div className="p-3.5 rounded-xl border border-success/30 bg-card/80 backdrop-blur-md shadow-sm">
-              <div className="flex items-center justify-between mb-1.5">
-                <div className="flex items-center gap-2">
-                  <Badge className="bg-success/20 text-success border-success/30 uppercase tracking-wider text-xs font-semibold">
-                    You (Candidate)
+            <div className="shrink-0 p-1.5 sm:p-2 rounded-xl border border-success/30 bg-card/80 backdrop-blur-md shadow-sm max-h-16 overflow-y-auto">
+              <div className="flex items-center justify-between mb-0.5">
+                <div className="flex items-center gap-1">
+                  <Badge className="bg-success/20 text-success border-success/30 uppercase tracking-wider text-[9px] font-semibold py-0 px-1">
+                    You
                   </Badge>
-                  <span className="flex h-2 w-2 relative">
+                  <span className="flex h-1.5 w-1.5 relative">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-success"></span>
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-success"></span>
                   </span>
                 </div>
-                <span className="text-xs text-success font-medium">Listening...</span>
+                <span className="text-[10px] text-success font-medium">Listening...</span>
               </div>
-              <p className="text-sm font-normal text-foreground/90 italic">
+              <p className="text-[11px] font-normal text-foreground/90 italic truncate">
                 "{currentCandidateSpeech}"
               </p>
             </div>
           )}
 
           {/* MEDIA HEALTH STATUS INDICATORS */}
-          <div className="flex items-center gap-2 text-xs flex-wrap px-1">
+          <div className="shrink-0 flex items-center gap-1 text-[10px] flex-wrap px-0.5">
             <Badge variant="outline" className={cn(
+              "text-[9px] py-0 px-1.5",
               preflightCameraStatus === "ready" ? "text-success border-success/30 bg-success/5" :
               preflightCameraStatus === "too_dark" ? "text-warning border-warning/30 bg-warning/5" : "text-muted-foreground"
             )}>
               Camera: {preflightCameraStatus === "ready" ? "Active" : preflightCameraStatus === "too_dark" ? "Too Dark" : "Checking"}
             </Badge>
             <Badge variant="outline" className={cn(
-              preflightMicStatus === "ready" ? "text-success border-success/30 bg-success/5" : "text-muted-foreground"
+              "text-[9px] py-0 px-1.5",
+              candidateDetected ? "text-success border-success/30 bg-success/5" : "text-amber-500 border-amber-500/30 bg-amber-500/5"
             )}>
-              Microphone: {preflightMicStatus === "ready" ? "Active" : "Checking"}
+              Candidate: {candidateDetected ? "Detected" : "Not Detected"}
             </Badge>
             <Badge variant="outline" className={cn(
+              "text-[9px] py-0 px-1.5",
+              preflightMicStatus === "ready" ? "text-success border-success/30 bg-success/5" : "text-muted-foreground"
+            )}>
+              Mic: {isListening ? "Listening" : "Paused"}
+            </Badge>
+            <Badge variant="outline" className={cn(
+              "text-[9px] py-0 px-1.5",
               preflightScreenStatus === "entire_screen" ? "text-success border-success/30 bg-success/5" :
               preflightScreenStatus === "stopped" ? "text-destructive border-destructive/30 bg-destructive/5" : "text-warning border-warning/30"
             )}>
-              Entire Screen: {preflightScreenStatus === "entire_screen" ? "Shared" : preflightScreenStatus === "stopped" ? "Stopped" : "Not Shared"}
+              Screen: {preflightScreenStatus === "entire_screen" ? "Shared" : preflightScreenStatus === "stopped" ? "Stopped" : "Not Shared"}
             </Badge>
             <Badge variant="outline" className={cn(
+              "text-[9px] py-0 px-1.5",
               interviewRecording.isRecording ? "text-destructive border-destructive/30 bg-destructive/5" : "text-muted-foreground"
             )}>
-              Recording: {interviewRecording.isRecording ? "Active" : interviewRecording.recordingStatus}
+              Rec: {interviewRecording.isRecording ? "Active" : interviewRecording.recordingStatus}
             </Badge>
           </div>
 
           {/* Voice Agent */}
           {voiceMode === "realtime" ? (
             <BhashiniVoiceAgent
+              onListeningChange={setIsListening}
+              mediaStream={preflightStream}
+              initialMessages={messages}
+              onMessage={(msg) => setMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg])}
               jobField={jobContext?.jobField}
               toughnessLevel={
                 jobContext?.toughnessLevel 
@@ -2268,25 +2385,27 @@ Output ONLY valid JSON in this structure:
                   ]);
                 }
               }}
-              autoConnect={true}
-              className="flex-1 min-h-0"
+              autoConnect={!isScreenInterrupted && status === "in-progress"}
+              className="flex-1 min-h-0 overflow-hidden"
             />
           ) : (
             <ContinuousVoicePanel
+              onListeningChange={setIsListening}
               messages={messages}
               isLoading={isLoading}
               onSendMessage={handleSendMessage}
               aiSpeaking={aiSpeaking}
-              autoListen={true}
+              autoListen={microphoneEnabled && !isScreenInterrupted && status === "in-progress"}
               onCandidateSpeech={setCurrentCandidateSpeech}
-              className="flex-1 min-h-0"
+              onBargeIn={stopSpeaking}
+              className="flex-1 min-h-0 overflow-hidden"
             />
           )}
         </div>
 
         {/* Right Panel - Workspace */}
         {workspaceMode !== "conversation" && (
-          <div className="col-span-5">
+          <div className="h-full min-h-0 min-w-0 flex flex-col overflow-hidden">
             <AnimatePresence mode="wait">
               {workspaceMode === "code" && (
                 <motion.div

@@ -18,10 +18,11 @@ export async function backendAuthHeaders(): Promise<Record<string, string>> {
   };
 }
 
-export async function invokeBackend<T>(path: string, body: unknown): Promise<T> {
+export async function invokeBackend<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(backendUrl(path), {
     method: "POST",
     headers: await backendAuthHeaders(),
+    signal,
     body: JSON.stringify(body),
   });
   const payload = await response.json().catch(() => null);

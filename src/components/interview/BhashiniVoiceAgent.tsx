@@ -53,14 +53,17 @@ interface BhashiniVoiceAgentProps {
   onMessage?: (message: VoiceMessage) => void;
   onConnectionChange?: (connected: boolean) => void;
   onSpeakingChange?: (isSpeaking: boolean) => void;
+  onListeningChange?: (isListening: boolean) => void;
   onLiveCaption?: (caption: LiveCaption) => void;
   className?: string;
   autoConnect?: boolean;
+  mediaStream?: MediaStream | null;
+  initialMessages?: VoiceMessage[];
 }
 
 // Voice activity detection tuning (kept tight for fast turn-taking)
 const SILENCE_THRESHOLD = 0.012;
-const SILENCE_HANG_MS = 650;
+const SILENCE_HANG_MS = 1100;
 const MIN_SPEECH_MS = 350;
 const MAX_UTTERANCE_MS = 30000;
 
@@ -76,13 +79,16 @@ export function BhashiniVoiceAgent({
   onMessage,
   onConnectionChange,
   onSpeakingChange,
+  onListeningChange,
   onLiveCaption,
   className,
   autoConnect = false,
+  mediaStream,
+  initialMessages = [],
 }: BhashiniVoiceAgentProps) {
   const { toast } = useToast();
   const [connectionState, setConnectionState] = useState<"idle" | "connecting" | "connected" | "error">("idle");
-  const [messages, setMessages] = useState<VoiceMessage[]>([]);
+  const [messages, setMessages] = useState<VoiceMessage[]>(initialMessages);
   const [isListening, setIsListening] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -90,6 +96,22 @@ export function BhashiniVoiceAgent({
   const [level, setLevel] = useState(0);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  }, [messages, isThinking]);
+
+  const ownsStreamRef = useRef(false);
+  const startingRef = useRef(false);
+  const generationRef = useRef(0);
+  const requestRef = useRef<AbortController | null>(null);
+  const speechChain = useRef<Promise<void>>(Promise.resolve());
+  const lockedVoice = useRef<string | null>(null);
+  const mediaRef = useRef(mediaStream); mediaRef.current = mediaStream;
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -99,9 +121,10 @@ export function BhashiniVoiceAgent({
   const lastVoiceAtRef = useRef<number>(0);
   const capturingRef = useRef(false);
   const busyRef = useRef(false);
+  const busyOwnerRef = useRef(0);
   const activeRef = useRef(false);
   const mutedRef = useRef(false);
-  const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
+  const historyRef = useRef<{ role: "user" | "assistant"; content: string }[]>(initialMessages.map(m => ({ role: m.role, content: m.content })));
   const queueRef = useRef<AudioQueue | null>(null);
   const startedRef = useRef(false);
   const remainingSecondsRef = useRef<number | undefined>(remainingSeconds);
@@ -110,6 +133,9 @@ export function BhashiniVoiceAgent({
   const onConnectionChangeRef = useRef(onConnectionChange);
   const onSpeakingChangeRef = useRef(onSpeakingChange);
   const onLiveCaptionRef = useRef(onLiveCaption);
+  const onListeningChangeRef = useRef(onListeningChange);
+  onListeningChangeRef.current = onListeningChange;
+  useEffect(() => { onListeningChangeRef.current?.(isListening); }, [isListening]);
 
   useEffect(() => {
     remainingSecondsRef.current = remainingSeconds;
@@ -134,74 +160,52 @@ export function BhashiniVoiceAgent({
     const msg: VoiceMessage = { id: crypto.randomUUID(), role, content, timestamp: new Date() };
     setMessages((prev) => [...prev, msg]);
     onMessageRef.current?.(msg);
+    return msg.id;
   }, []);
 
-  const speak = useCallback(
-    async (text: string) => {
-      const clean = sanitizeForSpeech(text);
-      if (!clean) return;
-      try {
-        const data = await invokeBackend<{ audioContent?: string }>("/api/bhashini-voice", {
-          action: "tts",
-          text: clean,
-          language,
-        });
-        if (data?.audioContent) {
-          queueRef.current?.enqueue(data.audioContent);
-          return;
-        }
-      } catch (e) {
-        console.warn("Bhashini TTS unavailable, using browser speech synthesis fallback:", e);
-      }
-
-      // Guaranteed audible fallback via browser SpeechSynthesis
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-        if (window.speechSynthesis.paused) {
-          window.speechSynthesis.resume();
-        }
-        const utterance = new SpeechSynthesisUtterance(clean);
-        utterance.rate = 0.95;
-        const voices = window.speechSynthesis.getVoices();
-        const voice = voices.find(
-          (v) => v.lang.startsWith("en-") && (v.name.includes("Google") || v.name.includes("Natural") || v.name.includes("Microsoft"))
-        ) || voices.find((v) => v.lang.startsWith("en-"));
-        if (voice) utterance.voice = voice;
-
-        utterance.onstart = () => {
-          setIsSpeaking(true);
-          onSpeakingChangeRef.current?.(true);
-        };
-        utterance.onend = () => {
-          setIsSpeaking(false);
-          onSpeakingChangeRef.current?.(false);
-        };
-        utterance.onerror = () => {
-          setIsSpeaking(false);
-          onSpeakingChangeRef.current?.(false);
-        };
-        window.speechSynthesis.speak(utterance);
-      }
-    },
-    [language]
-  );
+  const speak = useCallback((text: string) => {
+    const token = generationRef.current;
+    const clean = sanitizeForSpeech(text);
+    // Serialize synthesis so chunks cannot arrive or play out of sentence order.
+    speechChain.current = speechChain.current.catch(() => undefined).then(async () => {
+      if (!clean || token !== generationRef.current || !activeRef.current) return;
+      const started = performance.now();
+      const data = await invokeBackend<{ audioContent?: string }>("/api/bhashini-voice", {
+        action: "tts", text: clean, language, gender: "female", serviceId: lockedVoice.current || undefined,
+      }, requestRef.current?.signal);
+      if (token !== generationRef.current || !activeRef.current) return;
+      if (!data.audioContent) throw new Error("The speech provider returned no audio");
+      if (import.meta.env.DEV) console.debug(`[TTS] Generation ${Math.round(performance.now()-started)}ms`);
+      queueRef.current?.enqueue(data.audioContent);
+    });
+    return speechChain.current;
+  }, [language]);
 
   /** Streams the interviewer reply, emits real-time live captions, and speaks each sentence */
   const respond = useCallback(
-    async (userText: string) => {
+    async (userText: string, utteranceId: string = crypto.randomUUID(), isStart = false) => {
+      const token = ++generationRef.current;
+      requestRef.current?.abort();
+      const controller = new AbortController(); requestRef.current = controller;
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      const turnId = utteranceId;
       historyRef.current.push({ role: "user", content: userText });
       setIsThinking(true);
 
       let full = "";
       let buffer = "";
       const pending: Promise<void>[] = [];
+      let complete = false;
 
       try {
         const res = await fetch(backendUrl("/api/interview-agent"), {
           method: "POST",
           headers: await backendAuthHeaders(),
+          signal: controller.signal,
           body: JSON.stringify({
-            messages: historyRef.current,
+            messages: historyRef.current.slice(-24),
+            turnId, turnKind: isStart ? "start" : "answer",
+            previousQuestions: historyRef.current.filter(m => m.role === "assistant").slice(-50).map(m => m.content),
             jobField,
             toughnessLevel,
             jobTitle,
@@ -220,6 +224,7 @@ export function BhashiniVoiceAgent({
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          if (token !== generationRef.current || !activeRef.current) return;
           sseBuffer += decoder.decode(value, { stream: true });
           const lines = sseBuffer.split("\n");
           sseBuffer = lines.pop() ?? "";
@@ -227,9 +232,11 @@ export function BhashiniVoiceAgent({
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
             const payload = line.slice(6).trim();
-            if (!payload || payload === "[DONE]") continue;
+            if (payload === "[DONE]") { complete = true; continue; }
+            if (!payload) continue;
             try {
               const json = JSON.parse(payload);
+              if (json.error) throw new Error(json.error.message);
               const delta = json?.choices?.[0]?.delta?.content;
               if (!delta) continue;
               full += delta;
@@ -246,6 +253,7 @@ export function BhashiniVoiceAgent({
               let cut = extractSpeakableChunk(buffer);
               while (cut) {
                 pending.push(speak(cut.chunk));
+                void pending[pending.length-1].catch(() => undefined);
                 buffer = cut.rest;
                 cut = extractSpeakableChunk(buffer);
               }
@@ -255,8 +263,10 @@ export function BhashiniVoiceAgent({
           }
         }
 
+        if (!complete) throw new Error("Incomplete interviewer response");
         if (buffer.trim()) pending.push(speak(buffer.trim()));
         await Promise.all(pending);
+        if (token !== generationRef.current || !activeRef.current) return;
 
         if (full.trim()) {
           historyRef.current.push({ role: "assistant", content: full });
@@ -269,14 +279,16 @@ export function BhashiniVoiceAgent({
           });
         }
       } catch (e) {
-        console.error("Interview agent stream failed:", e);
+        if (controller.signal.aborted) return;
+        console.error("[Interview] Stream or speech provider failed", e);
         toast({
           title: "Connection issue",
           description: "The interviewer could not respond. Please try again.",
           variant: "destructive",
         });
       } finally {
-        setIsThinking(false);
+        clearTimeout(timeout);
+        if (token === generationRef.current) setIsThinking(false);
       }
     },
     [jobField, jobTitle, toughnessLevel, applicationId, durationSeconds, remainingSeconds, speak, pushMessage, toast]
@@ -284,7 +296,13 @@ export function BhashiniVoiceAgent({
 
   const transcribeAndRespond = useCallback(
     async (samples: Float32Array, sampleRate: number) => {
+      if (busyRef.current || !activeRef.current) return;
       busyRef.current = true;
+      const operation = ++busyOwnerRef.current;
+      const token = generationRef.current;
+      const controller = new AbortController();
+      requestRef.current = controller;
+      const started = performance.now();
       try {
         const pcm16k = downsampleTo16k(samples, sampleRate);
         const wav = encodeWav(pcm16k, 16000);
@@ -295,8 +313,10 @@ export function BhashiniVoiceAgent({
           audioContent,
           language,
           samplingRate: 16000,
-        });
+        }, controller.signal);
 
+        if (!activeRef.current || token !== generationRef.current) return;
+        if (import.meta.env.DEV) console.debug(`[STT] ASR ${Math.round(performance.now()-started)}ms`);
         const transcript = (data?.transcript ?? "").trim();
         if (transcript.length < 2) return;
 
@@ -308,15 +328,18 @@ export function BhashiniVoiceAgent({
           timestamp: Date.now(),
         });
 
-        pushMessage("user", transcript);
-        await respond(transcript);
+        const utteranceId = pushMessage("user", transcript);
+        await respond(transcript, utteranceId);
       } catch (e) {
-        console.error("Bhashini ASR failed:", e);
+        if (!controller.signal.aborted) {
+          console.error("Bhashini ASR failed:", e);
+          toast({ title: "Speech recognition failed", description: e instanceof Error ? e.message : "Please try again.", variant: "destructive" });
+        }
       } finally {
-        busyRef.current = false;
+        if (operation === busyOwnerRef.current) busyRef.current = false;
       }
     },
-    [language, pushMessage, respond]
+    [language, pushMessage, respond, toast]
   );
 
   const stopCapture = useCallback(() => {
@@ -324,7 +347,7 @@ export function BhashiniVoiceAgent({
     sourceRef.current?.disconnect();
     processorRef.current = null;
     sourceRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    if (ownsStreamRef.current) streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     void audioCtxRef.current?.close().catch(() => undefined);
     audioCtxRef.current = null;
@@ -334,18 +357,37 @@ export function BhashiniVoiceAgent({
     setLevel(0);
   }, []);
 
+  useEffect(() => {
+    if (!mediaStream || !activeRef.current || !audioCtxRef.current || !processorRef.current) return;
+    if (streamRef.current?.getAudioTracks()[0] === mediaStream.getAudioTracks()[0]) return;
+    sourceRef.current?.disconnect();
+    sourceRef.current = audioCtxRef.current.createMediaStreamSource(mediaStream);
+    sourceRef.current.connect(processorRef.current);
+    streamRef.current = mediaStream;
+    ownsStreamRef.current = false;
+  }, [mediaStream]);
+
   const start = useCallback(async () => {
-    if (activeRef.current) return;
+    if (activeRef.current || startingRef.current) return;
+    startingRef.current = true;
     setConnectionState("connecting");
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const voice = await invokeBackend<{ configured: boolean; serviceId: string }>("/api/bhashini-voice", { action: "status", language });
+      if (!voice.configured || !voice.serviceId) throw new Error("The interview speech provider is not ready");
+      if (lockedVoice.current && lockedVoice.current !== voice.serviceId) throw new Error("The selected interviewer voice is unavailable");
+      lockedVoice.current = voice.serviceId;
+      const shared = mediaRef.current;
+      const stream = shared?.getAudioTracks().some(t => t.readyState === "live") ? shared : await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      ownsStreamRef.current = stream !== shared;
+      if (!startingRef.current) { if (ownsStreamRef.current) stream.getTracks().forEach(t => t.stop()); return; }
       streamRef.current = stream;
 
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
+      await ctx.resume();
       const source = ctx.createMediaStreamSource(stream);
       sourceRef.current = source;
       const processor = ctx.createScriptProcessor(2048, 1, 1);
@@ -364,12 +406,14 @@ export function BhashiniVoiceAgent({
         const voiced = rms > SILENCE_THRESHOLD;
 
         // Don't record while the interviewer is talking or a turn is in flight
-        if (mutedRef.current || busyRef.current || queueRef.current?.isSpeaking) {
+        if (mutedRef.current || busyRef.current || queueRef.current?.isBusy || !streamRef.current?.getAudioTracks().some(t => t.enabled && t.readyState === "live" && !t.muted)) {
+          setIsListening(false);
           chunksRef.current = [];
           capturingRef.current = false;
           return;
         }
 
+        setIsListening(true);
         if (voiced) {
           if (!capturingRef.current) {
             capturingRef.current = true;
@@ -408,37 +452,39 @@ export function BhashiniVoiceAgent({
       queueRef.current = new AudioQueue((speaking) => {
         setIsSpeaking(speaking);
         onSpeakingChangeRef.current?.(speaking);
+        if (!speaking && activeRef.current && !busyRef.current) setIsListening(true);
+      }, (message) => {
+        console.error("[TTS] Playback failed");
+        toast({ title: "Audio playback error", description: message, variant: "destructive" });
       });
 
       activeRef.current = true;
       setConnectionState("connected");
       onConnectionChangeRef.current?.(true);
 
-      const greeting = candidateName
-        ? `Hello ${candidateName}, I'm Alex, your AI interviewer for the ${jobTitle} role. Let's begin — tell me when you're ready.`
-        : `Hello, I'm Alex, your AI interviewer for the ${jobTitle} role. Let's begin — tell me when you're ready.`;
-      pushMessage("assistant", greeting);
-      historyRef.current.push({ role: "assistant", content: greeting });
-      onLiveCaptionRef.current?.({
-        speaker: "ai",
-        text: greeting,
-        isFinal: true,
-        timestamp: Date.now(),
-      });
-      void speak(greeting);
+      if (!historyRef.current.length) {
+        busyRef.current = true;
+        const operation = ++busyOwnerRef.current;
+        try { await respond("Start the interview. Introduce yourself briefly and ask the first question.", crypto.randomUUID(), true); }
+        finally { if (operation === busyOwnerRef.current) busyRef.current = false; }
+      }
+
     } catch (e) {
       console.error("Failed to start voice session:", e);
+      stopCapture();
       setConnectionState("error");
       toast({
-        title: "Microphone access required",
-        description: "Please allow microphone access to start the voice interview.",
+        title: "Voice interview unavailable",
+        description: e instanceof Error ? e.message : "Check microphone permission and speech-provider configuration.",
         variant: "destructive",
       });
-    }
-  }, [candidateName, jobTitle, pushMessage, speak, toast, transcribeAndRespond]);
+    } finally { startingRef.current = false; }
+  }, [language, respond, stopCapture, toast, transcribeAndRespond]);
 
   const stop = useCallback(() => {
     activeRef.current = false;
+    busyOwnerRef.current++; busyRef.current = false;
+    startingRef.current = false; generationRef.current++; requestRef.current?.abort();
     queueRef.current?.stop();
     queueRef.current = null;
     stopCapture();
@@ -448,6 +494,7 @@ export function BhashiniVoiceAgent({
     onConnectionChangeRef.current?.(false);
     onSpeakingChangeRef.current?.(false);
   }, [stopCapture]);
+  const startRef = useRef(start); startRef.current = start;
 
   // Stop immediately if remaining seconds reach 0
   useEffect(() => {
@@ -459,21 +506,24 @@ export function BhashiniVoiceAgent({
   useEffect(() => {
     if (autoConnect && !startedRef.current) {
       startedRef.current = true;
-      void start();
+      void startRef.current();
     }
     return () => {
-      activeRef.current = false;
-      queueRef.current?.stop();
-      stopCapture();
+      stop(); startedRef.current = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoConnect]);
+  }, [autoConnect, stop]);
 
   const connected = connectionState === "connected";
+  const interrupt = () => {
+    busyOwnerRef.current++;
+    generationRef.current++; requestRef.current?.abort(); queueRef.current?.stop();
+    chunksRef.current = []; capturingRef.current = false; busyRef.current = false;
+    setIsThinking(false); setIsSpeaking(false); setIsListening(true); onSpeakingChangeRef.current?.(false);
+  };
   const status = isSpeaking ? "Interviewer speaking" : isThinking ? "Thinking..." : isListening ? "Listening" : connected ? "Ready" : "Not connected";
 
   return (
-    <div className={cn("flex flex-col rounded-xl border border-border bg-card/60 backdrop-blur-xl overflow-hidden", className)}>
+    <div className={cn("flex flex-col min-h-0 rounded-xl border border-border bg-card/60 backdrop-blur-xl overflow-hidden", className)}>
       {/* Header */}
       <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div className="flex items-center gap-3 min-w-0">
@@ -506,9 +556,10 @@ export function BhashiniVoiceAgent({
         </div>
       </div>
 
+      {isSpeaking && <Button size="sm" variant="outline" onClick={interrupt}>Interrupt &amp; answer</Button>}
       {/* Transcript */}
-      <ScrollArea className="flex-1">
-        <div ref={scrollRef} className="space-y-3 p-4">
+      <div className="flex-1 min-h-0 overflow-y-auto" ref={scrollRef}>
+        <div className="space-y-3 p-4">
           <AnimatePresence initial={false}>
             {messages.map((m) => (
               <motion.div
@@ -544,8 +595,11 @@ export function BhashiniVoiceAgent({
               <Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing response...
             </div>
           )}
+
+          {/* Internal scroll anchor */}
+          <div ref={messagesEndRef} className="h-0 w-full shrink-0" aria-hidden="true" />
         </div>
-      </ScrollArea>
+      </div>
 
       {/* Mic level footer */}
       <div className="flex items-center gap-3 border-t border-border px-4 py-3">

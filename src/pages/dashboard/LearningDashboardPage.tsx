@@ -232,8 +232,8 @@ export default function LearningDashboardPage() {
       try {
         const [scoresRes, questionsRes, appsRes] = await Promise.all([
           supabase.from("candidate_scores").select("final_score, recommendation"),
-          supabase.from("question_scores").select("question_text, score, technical_accuracy, time_taken_seconds").limit(20),
-          supabase.from("applications").select("id, status, created_at, completed_at"),
+          supabase.from("question_scores").select("question_text, score:weighted_score, technical_accuracy, time_taken_seconds").limit(20),
+          supabase.from("applications").select("id, status, applied_at, completed_at"),
         ]);
 
         const scores = scoresRes.data || [];

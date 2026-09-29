@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
 export type ProctoringEventType =
@@ -48,6 +48,7 @@ export function useProctoringLogger({
   const lastLoggedTimes = useRef<Map<string, number>>(new Map());
   const flushTimerRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<Date | null>(null);
+  const recordedRef = useRef(false);
 
   // Flush events to database
   const flushEvents = useCallback(async () => {
@@ -123,17 +124,22 @@ export function useProctoringLogger({
     }
   }, [batchSize, flushEvents]);
 
+  const flushRef = useRef(flushEvents); flushRef.current = flushEvents;
+  useEffect(() => () => { if (flushTimerRef.current) clearInterval(flushTimerRef.current); void flushRef.current(); }, []);
+
   // Start logging session
-  const startLogging = useCallback(() => {
+  const startLogging = useCallback((recordingActive = false) => {
+    if (flushTimerRef.current) return;
     startTimeRef.current = new Date();
     
     // Set up periodic flush
     flushTimerRef.current = setInterval(() => {
-      void flushEvents();
+      void flushRef.current();
     }, flushInterval);
 
     // Log recording start
-    logEvent({
+    recordedRef.current = recordingActive;
+    if (recordingActive) logEvent({
       type: "recording_started",
       timestamp: new Date(),
       severity: "low",
@@ -144,12 +150,13 @@ export function useProctoringLogger({
   // Stop logging session
   const stopLogging = useCallback(async () => {
     // Log recording stop
-    logEvent({
+    if (recordedRef.current) logEvent({
       type: "recording_stopped",
       timestamp: new Date(),
       severity: "low",
       description: "Interview recording and monitoring stopped",
     });
+    recordedRef.current = false;
 
     // Clear timer and flush remaining events
     if (flushTimerRef.current) {

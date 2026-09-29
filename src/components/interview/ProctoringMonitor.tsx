@@ -23,6 +23,7 @@ interface ProctoringMonitorProps {
   isActive: boolean;
   onEvent: (event: ProctoringEvent) => void;
   onTrustScoreChange?: (score: number) => void;
+  onFaceDetectedChange?: (detected: boolean) => void;
   applicationId?: string | null;
   candidateId?: string | null;
   recordingId?: string | null;
@@ -35,6 +36,7 @@ export function ProctoringMonitor({
   isActive,
   onEvent,
   onTrustScoreChange,
+  onFaceDetectedChange,
   applicationId = null,
   candidateId = null,
   recordingId = null,
@@ -55,6 +57,11 @@ export function ProctoringMonitor({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const faceCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  const faceDetectedRef = useRef(true);
+  useEffect(() => {
+    faceDetectedRef.current = faceDetected;
+  }, [faceDetected]);
+
   // Use proctoring logger for database persistence
   const proctoringLogger = useProctoringLogger({
     applicationId,
@@ -74,62 +81,62 @@ export function ProctoringMonitor({
     };
   }, [isActive, applicationId, candidateId]);
 
+  const callbacksRef = useRef({ onEvent, onTrustScoreChange, onFaceDetectedChange, proctoringLogger, applicationId, candidateId });
+  callbacksRef.current = { onEvent, onTrustScoreChange, onFaceDetectedChange, proctoringLogger, applicationId, candidateId };
+  const warningTimer = useRef<ReturnType<typeof setTimeout>>();
+
   // Helper to log event both locally and to database
   const logProctoringEvent = useCallback((event: ProctoringEvent) => {
     setEvents((prev) => [...prev, event]);
-    onEvent(event);
+    callbacksRef.current.onEvent(event);
     
     // Log to database if configured
-    if (applicationId && candidateId) {
-      proctoringLogger.logEvent(event);
+    if (callbacksRef.current.applicationId && callbacksRef.current.candidateId) {
+      callbacksRef.current.proctoringLogger.logEvent(event);
     }
-  }, [onEvent, applicationId, candidateId, proctoringLogger]);
+  }, []);
 
   // Camera monitoring setup
   useEffect(() => {
     if (!isActive || !enableCameraMonitoring) return;
 
+    let cancelled = false;
+    let consecutiveDark = 0;
+    let lastPenaltyTimestamp = 0;
+
     const setupCameraMonitoring = async () => {
       try {
-        let stream = mediaStream;
-        if (!stream) {
-          stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: "user" },
-            audio: false,
-          });
+        const stream = mediaStream;
+        if (!stream) return;
+
+        const video = videoRef.current;
+        if (video) {
+          if (video.srcObject !== stream) {
+            video.srcObject = stream;
+          }
+          try {
+            await video.play();
+          } catch (_) {}
         }
 
-        // Create hidden video element for monitoring
-        const video = document.createElement("video");
-        video.srcObject = stream;
-        video.autoplay = true;
-        video.muted = true;
-        video.playsInline = true;
-        try {
-          await video.play();
-        } catch (_) {}
-        videoRef.current = video;
+        const isStreamLive = stream.getVideoTracks().some(t => t.readyState === "live" && t.enabled && !t.muted);
+        setCameraStatus(isStreamLive ? "active" : "blocked");
 
-        setCameraStatus("active");
-
-        // Log camera active
-        logProctoringEvent({
-          type: "face_detected",
-          timestamp: new Date(),
-          severity: "low",
-          description: "Camera active, monitoring started",
-        });
-
-        // Brightness-based camera obstruction & covered detection
+        // Brightness-based obstruction & candidate face presence verification
         faceCheckIntervalRef.current = setInterval(() => {
-          if (videoRef.current && (videoRef.current.readyState >= 2 || videoRef.current.videoWidth > 0)) {
+          const liveTrack = stream.getVideoTracks().some(t => t.readyState === "live" && t.enabled && !t.muted);
+          setCameraStatus(liveTrack ? "active" : "blocked");
+          if (!liveTrack) return;
+
+          const currentVideo = videoRef.current;
+          if (currentVideo && (currentVideo.readyState >= 2 || currentVideo.videoWidth > 0)) {
             const canvas = document.createElement("canvas");
             canvas.width = 64;
             canvas.height = 48;
             const ctx = canvas.getContext("2d");
             if (ctx) {
               try {
-                ctx.drawImage(videoRef.current, 0, 0, 64, 48);
+                ctx.drawImage(currentVideo, 0, 0, 64, 48);
                 const imageData = ctx.getImageData(0, 0, 64, 48);
                 const data = imageData.data;
                 
@@ -140,45 +147,51 @@ export function ProctoringMonitor({
                 }
                 const avgBrightness = totalBrightness / (data.length / 4);
                 
-                // Average brightness below 20 indicates camera is covered, blocked, or pitch black
-                if (avgBrightness < 20) {
-                  if (faceDetected) {
-                    setFaceDetected(false);
-                    setCameraStatus("blocked");
-                    
-                    const event: ProctoringEvent = {
-                      type: "camera_blocked",
-                      timestamp: new Date(),
-                      severity: "high",
-                      description: "Camera blocked or covered by hand/obstruction",
-                    };
-                    logProctoringEvent(event);
+                // If brightness is genuinely pitch black (< 10) for 4 consecutive checks (6+ seconds)
+                if (avgBrightness < 10) {
+                  consecutiveDark++;
+                  if (consecutiveDark >= 4) {
+                    if (faceDetectedRef.current) {
+                      setFaceDetected(false);
+                      callbacksRef.current.onFaceDetectedChange?.(false);
+                      if (import.meta.env.DEV) console.debug("[Proctoring] Candidate not detected: feed pitch black", avgBrightness);
+                    }
 
-                    setTrustScore((prev) => {
-                      const newScore = Math.max(0, prev - 15);
-                      onTrustScoreChange?.(newScore);
-                      return newScore;
-                    });
+                    const now = Date.now();
+                    if (now - lastPenaltyTimestamp > 45000) {
+                      lastPenaltyTimestamp = now;
+                      const event: ProctoringEvent = {
+                        type: "camera_blocked",
+                        timestamp: new Date(),
+                        severity: "medium",
+                        description: "Camera feed obstructed or pitch black",
+                      };
+                      logProctoringEvent(event);
 
-                    setWarningMessage("Camera covered! Please keep camera unobstructed.");
-                    setShowWarning(true);
-                    toast({
-                      title: "Camera Blocked Detected",
-                      description: "Your camera is covered. Please uncover your camera to avoid trust score deductions.",
-                      variant: "destructive",
-                    });
-                    setTimeout(() => setShowWarning(false), 5000);
+                      setTrustScore((prev) => {
+                        const newScore = Math.max(0, prev - 5);
+                        callbacksRef.current.onTrustScoreChange?.(newScore);
+                        return newScore;
+                      });
+
+                      setWarningMessage("Camera covered! Please keep camera unobstructed.");
+                      setShowWarning(true);
+                      toast({
+                        title: "Camera Obstruction Warning",
+                        description: "Please keep your camera uncovered and well-lit.",
+                        variant: "destructive",
+                      });
+                      clearTimeout(warningTimer.current);
+                      warningTimer.current = setTimeout(() => setShowWarning(false), 5000);
+                    }
                   }
-                } else if (!faceDetected && avgBrightness >= 25) {
-                  setFaceDetected(true);
-                  setCameraStatus("active");
-                  
-                  logProctoringEvent({
-                    type: "face_detected",
-                    timestamp: new Date(),
-                    severity: "low",
-                    description: "Camera feed unobstructed and active",
-                  });
+                } else if (avgBrightness >= 15) {
+                  consecutiveDark = 0;
+                  if (!faceDetectedRef.current) {
+                    setFaceDetected(true);
+                    callbacksRef.current.onFaceDetectedChange?.(true);
+                    if (import.meta.env.DEV) console.debug("[Proctoring] Candidate detected: feed bright and clear", avgBrightness);
+                  }
                 }
               } catch (_) {}
             }
@@ -186,7 +199,7 @@ export function ProctoringMonitor({
         }, 1500); // Check every 1.5 seconds
 
       } catch (error) {
-        console.error("Camera access failed:", error);
+        console.error("Camera access failed in proctoring:", error);
         setCameraStatus("blocked");
         
         logProctoringEvent({
@@ -201,15 +214,20 @@ export function ProctoringMonitor({
     setupCameraMonitoring();
 
     return () => {
+      cancelled = true; clearTimeout(warningTimer.current);
       if (faceCheckIntervalRef.current) {
         clearInterval(faceCheckIntervalRef.current);
+        faceCheckIntervalRef.current = null;
       }
-      if (videoRef.current?.srcObject) {
-        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-        tracks.forEach((track) => track.stop());
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+        videoRef.current = null;
+      }
+      if (isSelfAllocated && localStream) {
+        localStream.getTracks().forEach((track) => track.stop());
       }
     };
-  }, [isActive, enableCameraMonitoring, faceDetected, logProctoringEvent, onTrustScoreChange]);
+  }, [isActive, enableCameraMonitoring, mediaStream, logProctoringEvent]);
 
   // Monitor tab visibility
   useEffect(() => {
@@ -234,7 +252,7 @@ export function ProctoringMonitor({
         const penalty = tabSwitchCount.current > 3 ? 10 : 5;
         setTrustScore((prev) => {
           const newScore = Math.max(0, prev - penalty);
-          onTrustScoreChange?.(newScore);
+          callbacksRef.current.onTrustScoreChange?.(newScore);
           return newScore;
         });
 
@@ -280,7 +298,7 @@ export function ProctoringMonitor({
 
       setTrustScore((prev) => {
         const newScore = Math.max(0, prev - 8);
-        onTrustScoreChange?.(newScore);
+        callbacksRef.current.onTrustScoreChange?.(newScore);
         return newScore;
       });
     };
@@ -350,16 +368,16 @@ export function ProctoringMonitor({
         </div>
       </div>
 
-      {/* Camera Status */}
+      {/* Camera & Candidate Status */}
       {enableCameraMonitoring && (
-        <div className="mt-2 flex items-center gap-2">
+        <div className="mt-2 flex items-center gap-2 flex-wrap">
           <Badge 
             variant="outline" 
             className={cn(
               "text-xs gap-1",
               cameraStatus === "active" 
-                ? "text-success border-success/30" 
-                : "text-danger border-danger/30"
+                ? "text-success border-success/30 bg-success/5" 
+                : "text-destructive border-destructive/30 bg-destructive/5"
             )}
           >
             {cameraStatus === "active" ? (
@@ -367,24 +385,34 @@ export function ProctoringMonitor({
                 <Camera className="h-3 w-3" />
                 Camera Active
               </>
-            ) : cameraStatus === "blocked" ? (
-              <>
-                <CameraOff className="h-3 w-3" />
-                Camera Blocked
-              </>
             ) : (
               <>
-                <Video className="h-3 w-3 animate-pulse" />
-                Checking...
+                <CameraOff className="h-3 w-3" />
+                Camera Inactive
               </>
             )}
           </Badge>
-          {faceDetected && cameraStatus === "active" && (
-            <Badge variant="outline" className="text-xs gap-1 text-success border-success/30">
-              <Eye className="h-3 w-3" />
-              Face Visible
-            </Badge>
-          )}
+          <Badge
+            variant="outline"
+            className={cn(
+              "text-xs gap-1",
+              faceDetected
+                ? "text-success border-success/30 bg-success/5"
+                : "text-amber-500 border-amber-500/30 bg-amber-500/5"
+            )}
+          >
+            {faceDetected ? (
+              <>
+                <Eye className="h-3 w-3" />
+                Candidate Detected
+              </>
+            ) : (
+              <>
+                <EyeOff className="h-3 w-3" />
+                Candidate Not Detected
+              </>
+            )}
+          </Badge>
         </div>
       )}
 
@@ -422,6 +450,8 @@ export function ProctoringMonitor({
           </motion.div>
         )}
       </AnimatePresence>
+      {/* Hidden attached video element for browser frame decoding */}
+      <video ref={videoRef} autoPlay playsInline muted className="hidden pointer-events-none" />
     </div>
   );
 }

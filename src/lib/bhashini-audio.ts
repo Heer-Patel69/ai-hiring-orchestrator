@@ -91,11 +91,16 @@ export class AudioQueue {
   private queue: string[] = [];
   private playing = false;
   private current: HTMLAudioElement | null = null;
+  private cancelPlayback: (() => void) | null = null;
+  private generation = 0;
+  private speaking = false;
   private onStateChange?: (speaking: boolean) => void;
+  private onError?: (message: string) => void;
   public volume = 1;
 
-  constructor(onStateChange?: (speaking: boolean) => void) {
+  constructor(onStateChange?: (speaking: boolean) => void, onError?: (message: string) => void) {
     this.onStateChange = onStateChange;
+    this.onError = onError;
   }
 
   enqueue(base64Audio: string) {
@@ -105,40 +110,58 @@ export class AudioQueue {
   }
 
   private async playNext() {
+    const generation = this.generation;
     const next = this.queue.shift();
     if (!next) {
       this.playing = false;
+      this.speaking = false;
       this.onStateChange?.(false);
       return;
     }
     this.playing = true;
-    this.onStateChange?.(true);
     try {
       const audio = new Audio(`data:audio/wav;base64,${next}`);
       audio.volume = this.volume;
       this.current = audio;
       await new Promise<void>((resolve) => {
+        this.cancelPlayback = resolve;
+        audio.onplaying = () => {
+          if (generation !== this.generation) return;
+          this.speaking = true;
+          this.onStateChange?.(true);
+        };
         audio.onended = () => resolve();
-        audio.onerror = () => resolve();
-        void audio.play().catch(() => resolve());
+        audio.onerror = () => { this.onError?.("The interviewer audio could not be played"); resolve(); };
+        void audio.play().catch(() => { this.onError?.("Audio playback was blocked. Enable sound and retry."); resolve(); });
       });
     } finally {
+      if (generation !== this.generation) return;
       this.current = null;
+      this.cancelPlayback = null;
+      this.speaking = false;
+      this.onStateChange?.(false);
       void this.playNext();
     }
   }
 
   stop() {
+    this.generation++;
     this.queue = [];
     if (this.current) {
       this.current.pause();
+      this.current.onplaying = this.current.onended = this.current.onerror = null;
       this.current = null;
     }
     this.playing = false;
+    this.speaking = false;
+    this.cancelPlayback?.();
+    this.cancelPlayback = null;
     this.onStateChange?.(false);
   }
 
   get isSpeaking() {
-    return this.playing;
+    return this.speaking;
   }
+
+  get isBusy() { return this.playing || this.queue.length > 0; }
 }

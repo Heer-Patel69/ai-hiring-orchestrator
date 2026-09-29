@@ -108,7 +108,7 @@ export default function FairnessDashboardPage() {
     try {
       const { data: apps } = await supabase
         .from("applications")
-        .select("id, status, overall_score, candidate_id, created_at");
+        .select("id, status, overall_score, candidate_id, applied_at");
 
       if (apps && apps.length > 0) {
         const completed = apps.filter(a => a.status === "completed" || (a.overall_score && a.overall_score >= 60));

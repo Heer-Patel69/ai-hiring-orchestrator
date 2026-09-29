@@ -96,11 +96,12 @@ export function InterviewRecordingViewer({
           .from("interview_recordings")
           .select("*")
           .eq("application_id", applicationId)
+          .order("created_at", { ascending: false }).limit(1)
           .maybeSingle();
 
         if (recordingError) throw recordingError;
 
-        let resolvedRecording = recordingData;
+        let resolvedRecording: InterviewRecording | null = recordingData;
         let effectiveVideoUrl = recordingData?.video_url || "";
 
         // Check if there is a cached recording URL in session storage

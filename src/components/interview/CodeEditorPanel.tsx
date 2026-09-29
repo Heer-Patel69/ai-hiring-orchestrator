@@ -45,8 +45,8 @@ interface CodeAnalysis {
   explanation: string;
   testResults?: Array<{
     passed: boolean;
-    actual: string;
-    expected: string;
+    actual?: string;
+    expected?: string;
   }>;
 }
 
@@ -196,10 +196,10 @@ export function CodeEditorPanel({
   };
 
   return (
-    <div className={cn("flex flex-col h-full rounded-xl border border-border bg-card", className)}>
+    <div className={cn("flex flex-col h-full min-h-0 min-w-0 overflow-hidden rounded-xl border border-border bg-card", className)}>
       {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-border">
-        <div className="flex items-center gap-3">
+      <div className="flex flex-wrap shrink-0 items-center justify-between gap-2 p-3 border-b border-border">
+        <div className="flex flex-wrap min-w-0 items-center gap-2">
           <Select value={language} onValueChange={handleLanguageChange}>
             <SelectTrigger className="w-36 h-8">
               <Code2 className="h-4 w-4 mr-2" />
@@ -242,14 +242,14 @@ export function CodeEditorPanel({
 
       {/* Problem Statement */}
       {problemStatement && (
-        <div className="p-3 border-b border-border bg-secondary/30">
+        <div className="p-3 max-h-32 overflow-y-auto shrink-0 border-b border-border bg-secondary/30">
           <p className="text-sm text-muted-foreground">{problemStatement}</p>
         </div>
       )}
 
       {/* Tabs */}
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1 flex flex-col min-h-0">
-        <TabsList className="mx-3 mt-2 w-fit">
+        <TabsList className="mx-3 mt-2 w-fit shrink-0">
           <TabsTrigger value="editor" className="gap-1.5">
             <Code2 className="h-3.5 w-3.5" />
             Editor

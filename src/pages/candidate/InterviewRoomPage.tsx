@@ -82,6 +82,16 @@ export default function InterviewRoomPage() {
     };
   }, [user, authLoading]);
 
+  // Ensure video element always binds to stream
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      if (videoRef.current.srcObject !== stream) {
+        videoRef.current.srcObject = stream;
+      }
+      videoRef.current.play().catch(() => {});
+    }
+  }, [stream]);
+
   const fetchPendingInterviews = async () => {
     try {
       console.log("Fetching pending interviews for user:", user!.id);

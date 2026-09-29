@@ -1,3 +1,4 @@
+import { claimTurn, finishTurn } from "./turn-store.js";
 import crypto from "node:crypto";
 import express from "express";
 import { Pool } from "pg";
@@ -31,6 +32,7 @@ export function loadConfig(env = process.env) {
   if (appEnv !== "production") {
     configuredOrigins.add("http://localhost:5173");
     configuredOrigins.add("http://localhost:8080");
+    configuredOrigins.add("http://127.0.0.1:8080");
   }
   if (appEnv === "production" && configuredOrigins.size === 0) {
     throw new Error("CORS_ORIGINS or FRONTEND_URL is required in production");
@@ -62,8 +64,8 @@ export function loadConfig(env = process.env) {
     groqKeys,
     groqModel: env.GROQ_MODEL?.trim() || "openai/gpt-oss-120b",
     groqBaseUrl: (env.GROQ_BASE_URL?.trim() || DEFAULT_GROQ_URL).replace(/\/$/, ""),
-    bhashiniUserId: env.BHASHINI_UDYAT_KEY?.trim() || env.BHASHINI_USER_ID?.trim() || "",
-    bhashiniApiKey: env.BHASHINI_INFERENCE_KEY?.trim() || env.BHASHINI_ULCA_API_KEY?.trim() || "",
+    bhashiniUserId: env.BHASHINI_USER_ID?.trim() || env.BHASHINI_UDYAT_KEY?.trim() || "",
+    bhashiniApiKey: env.BHASHINI_ULCA_API_KEY?.trim() || env.BHASHINI_INFERENCE_KEY?.trim() || "",
     bhashiniPipelineId: env.BHASHINI_PIPELINE_ID?.trim() || DEFAULT_BHASHINI_PIPELINE_ID,
   };
 }
@@ -101,7 +103,7 @@ function availableGroqKeys(config) {
   });
 }
 
-async function callGroq(config, payload, requestId) {
+export async function callGroq(config, payload, requestId, parentSignal) {
   const keys = availableGroqKeys(config);
   if (keys.length === 0) throw Object.assign(new Error("All Groq keys are temporarily unavailable"), { status: 503 });
 
@@ -113,7 +115,7 @@ async function callGroq(config, payload, requestId) {
         method: "POST",
         headers: { Authorization: `Bearer ${key.value}`, "Content-Type": "application/json", "x-request-id": requestId },
         body: JSON.stringify(payload),
-        signal: controller.signal,
+        signal: parentSignal ? AbortSignal.any([controller.signal, parentSignal]) : controller.signal,
       });
       clearTimeout(timer);
       if (response.ok) {
@@ -121,18 +123,20 @@ async function callGroq(config, payload, requestId) {
         return response;
       }
       if (response.status === 401 || response.status === 403) {
+        log("warn", "LLM_KEY_REJECTED", { requestId, status: response.status });
         groqHealth.set(key.id, { retryAt: Number.MAX_SAFE_INTEGER, status: "invalid" });
         continue;
       }
       if (response.status === 429 || response.status >= 500) {
+        log("warn", "LLM_PROVIDER_UNAVAILABLE", { requestId, status: response.status });
         const retrySeconds = Math.min(300, Math.max(20, Number(response.headers.get("retry-after") || 30)));
         groqHealth.set(key.id, { retryAt: Date.now() + retrySeconds * 1000, status: "cooldown" });
         continue;
       }
-      const detail = await response.text();
-      throw Object.assign(new Error(`Groq rejected the request (${response.status}): ${detail.slice(0, 160)}`), { status: response.status });
+      throw Object.assign(new Error(`Groq rejected the request (${response.status})`), { status: response.status });
     } catch (error) {
       clearTimeout(timer);
+      if (parentSignal?.aborted) throw error;
       if (error?.status && error.status < 500) throw error;
       groqHealth.set(key.id, { retryAt: Date.now() + 20_000, status: "unavailable" });
     }
@@ -159,7 +163,12 @@ async function getBhashiniPipeline(config, task, language) {
     }),
     signal: controller.signal,
   }).finally(() => clearTimeout(timer));
-  if (!response.ok) throw Object.assign(new Error(`Bhashini configuration failed (${response.status})`), { status: 502 });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const code = payload?.code || payload?.error?.code;
+    log("warn", "BHASHINI_CONFIG_REJECTED", { status: response.status, code: typeof code === "string" ? code.slice(0, 80) : undefined });
+    throw Object.assign(new Error(`Bhashini configuration failed (${response.status}). Check BHASHINI_USER_ID, BHASHINI_ULCA_API_KEY and the pipeline's supported tasks.`), { status: 502 });
+  }
   const data = await response.json();
   const taskConfig = data?.pipelineResponseConfig?.[0]?.config?.[0];
   const endpoint = data?.pipelineInferenceAPIEndPoint;
@@ -177,8 +186,9 @@ async function getBhashiniPipeline(config, task, language) {
   return result;
 }
 
-async function callBhashini(config, task, language, input, samplingRate, gender) {
+export async function callBhashini(config, task, language, input, samplingRate, gender, lockedServiceId) {
   const pipeline = await getBhashiniPipeline(config, task, language);
+  if (lockedServiceId && pipeline.serviceId !== lockedServiceId) throw Object.assign(new Error("The interview's selected voice is no longer available. The voice was not changed."), { status: 502 });
   const body = task === "asr"
     ? {
         pipelineTasks: [{ taskType: "asr", config: { language: { sourceLanguage: language }, serviceId: pipeline.serviceId, audioFormat: "wav", samplingRate, livenessCheck: false } }],
@@ -208,6 +218,9 @@ const messageSchema = z.object({
 const interviewSchema = z.object({
   messages: z.array(messageSchema).max(100).default([]),
   applicationId: z.string().uuid(),
+  turnId: z.string().uuid().optional(),
+  turnKind: z.enum(["start", "answer"]).default("answer"),
+  previousQuestions: z.array(z.string().max(2000)).max(50).default([]),
   durationSeconds: z.number().int().min(30).max(14_400).default(120),
   remainingSeconds: z.number().int().min(0).max(14_400).optional(),
   currentQuestionIndex: z.number().int().min(0).max(100).optional(),
@@ -220,7 +233,7 @@ const interviewSchema = z.object({
 const voiceSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("status"), language: z.string().optional() }),
   z.object({ action: z.literal("asr"), audioContent: z.string().min(20).max(28_000_000), language: z.string().optional(), samplingRate: z.number().int().min(8000).max(48000).default(16000) }),
-  z.object({ action: z.literal("tts"), text: z.string().trim().min(1).max(5000), language: z.string().optional(), gender: z.enum(["female", "male"]).default("female") }),
+  z.object({ action: z.literal("tts"), text: z.string().trim().min(1).max(5000), language: z.string().optional(), serviceId: z.string().max(200).optional(), gender: z.enum(["female", "male"]).default("female") }),
 ]);
 
 export function createApp(config) {
@@ -300,16 +313,38 @@ export function createApp(config) {
     const parsed = interviewSchema.safeParse(req.body);
     if (!parsed.success) return apiError(res, 400, "VALIDATION_ERROR", parsed.error.issues[0]?.message || "Invalid request", req.requestId);
     const input = parsed.data;
+    let claimed = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45000);
+    const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+    res.on("close", disconnect);
     try {
       const { data: application, error: appError } = await admin
         .from("applications")
         .select("id,candidate_id,job_id,current_round,started_at,duration_seconds,expires_at,status,interview_context_snapshot,jobs(id,title,description,field,required_skills,toughness_level,experience_level)")
         .eq("id", input.applicationId)
-        .eq("candidate_id", req.user.id)
         .maybeSingle();
       if (appError) throw appError;
       if (!application) return apiError(res, 404, "APPLICATION_NOT_FOUND", "The application was not found or is not accessible", req.requestId);
 
+      // Verify that the user is the candidate or has recruiter/interviewer privileges
+      const isCandidate = application.candidate_id === req.user.id;
+      if (!isCandidate) {
+        const { data: roleRow } = await admin.from("user_roles").select("role").eq("user_id", req.user.id).maybeSingle();
+        const role = roleRow?.role;
+        if (role !== "interviewer" && role !== "admin") {
+          return apiError(res, 403, "FORBIDDEN", "You are not authorized to access this interview", req.requestId);
+        }
+      }
+
+      if (input.turnId) {
+        const claim = await claimTurn(pool, application.id, input.turnId, input.messages);
+        if (!claim.claimed) {
+          res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+          return res.end(claim.response);
+        }
+        claimed = true;
+      }
       const now = Date.now();
       let remainingSeconds = input.remainingSeconds;
       if (!application.started_at || !application.expires_at) {
@@ -324,7 +359,9 @@ export function createApp(config) {
       if (remainingSeconds <= 0) {
         const closing = "Our scheduled interview time has concluded. Thank you for your time; your responses have been submitted for evaluation.";
         res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-        return res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: closing } }] })}\n\ndata: [DONE]\n\n`);
+        const event = `data: ${JSON.stringify({ choices: [{ delta: { content: closing } }] })}\n\ndata: [DONE]\n\n`;
+        if (claimed) await finishTurn(pool, input.applicationId, input.turnId, "complete", event);
+        return res.end(event);
       }
 
       const roundNumber = (application.current_round || 0) + 1;
@@ -366,8 +403,8 @@ export function createApp(config) {
       }
 
       const latestUserMessage = [...input.messages].reverse().find((message) => message.role === "user");
-      if (latestUserMessage) {
-        const { error } = await admin.from("interview_transcripts").insert({ application_id: application.id, role: "candidate", content: latestUserMessage.content, phase: `round_${roundNumber}`, timestamp_ms: now });
+      if (latestUserMessage && input.turnKind === "answer") {
+        const { error } = await admin.from("interview_transcripts").upsert({ ...(input.turnId ? { id: input.turnId } : {}), application_id: application.id, role: "candidate", content: latestUserMessage.content, phase: `round_${roundNumber}`, timestamp_ms: now }, { onConflict: "id" });
         if (error) log("warn", "TRANSCRIPT_SAVE_FAILED", { requestId: req.requestId, applicationId: application.id });
       }
 
@@ -376,14 +413,61 @@ export function createApp(config) {
         systemPrompt += "\nThe candidate asked to end. Ask one short reason, allow them to decline, and request confirmation before finalization.";
       }
       log("info", "INTERVIEW_CONTEXT_READY", { requestId: req.requestId, candidateId: req.user.id, applicationId: application.id, roundNumber });
-      const upstream = await callGroq(config, { model: config.groqModel, messages: [{ role: "system", content: systemPrompt }, ...input.messages], temperature: 0.4, max_tokens: 300, stream: true }, req.requestId);
+      const asked = input.previousQuestions.length ? input.previousQuestions : input.messages.filter(m => m.role === "assistant").map(m => m.content);
+      systemPrompt += "\n\nPREVIOUS QUESTIONS ASKED IN THIS SESSION (DO NOT REPEAT ANY OF THESE):\n" + asked.slice(-50).map((q, idx) => `${idx + 1}. ${q.slice(0, 300)}`).join("\n");
+      const started = performance.now();
+
+      // Structured Development Diagnostics as requested
+      console.log(`[Interview AI]
+model: ${config.groqModel}
+request ID: ${req.requestId}
+interview ID: ${application.id}
+question number: ${asked.length + 1}
+conversation history length: ${input.messages.length}
+latest candidate transcript: ${latestUserMessage?.content || "N/A"}
+LLM request started: ${new Date().toISOString()}`);
+
+      const upstream = await callGroq(config, {
+        model: config.groqModel,
+        messages: [{ role: "system", content: systemPrompt }, ...input.messages.filter(m => m.role !== "system").slice(-24)],
+        temperature: 0.7,
+        max_tokens: 350,
+        reasoning_format: "hidden",
+        stream: true
+      }, req.requestId, controller.signal);
+
       res.status(200).set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
-      for await (const chunk of upstream.body) res.write(chunk);
+      let streamed = "", first = true;
+      const decoder = new TextDecoder();
+      for await (const chunk of upstream.body) {
+        controller.signal.throwIfAborted();
+        if (first) { first = false; log("info", "LLM_FIRST_CHUNK", { requestId: req.requestId, ms: Math.round(performance.now()-started) }); }
+        streamed += decoder.decode(chunk, { stream: true }); res.write(chunk);
+      }
+      streamed += decoder.decode();
+      if (!streamed.includes("[DONE]")) throw new Error("Incomplete LLM stream");
+      if (claimed) await finishTurn(pool, input.applicationId, input.turnId, "complete", streamed);
+      
+      const latencyMs = Math.round(performance.now() - started);
+      console.log(`[Interview AI]
+model: ${config.groqModel}
+request ID: ${req.requestId}
+LLM response received: ${new Date().toISOString()}
+latency: ${latencyMs}ms`);
+
+      log("info", "LLM_COMPLETED", { requestId: req.requestId, ms: latencyMs });
       res.end();
     } catch (error) {
+      console.error(`[Interview AI]
+request ID: ${req.requestId}
+interview ID: ${input.applicationId}
+error: ${error.message}`);
+      if (claimed) await finishTurn(pool, input.applicationId, input.turnId, "failed").catch(e => log("error", "TURN_SAVE_FAILED", { requestId: req.requestId, message: e.message }));
       log("error", "INTERVIEW_AGENT_FAILED", { requestId: req.requestId, candidateId: req.user.id, applicationId: input.applicationId, message: error.message });
       if (!res.headersSent) return apiError(res, error.status || 500, "INTERVIEW_AGENT_FAILED", error.status ? error.message : "The interviewer could not process this request", req.requestId);
-      res.end();
+      res.end(`data: ${JSON.stringify({ error: { message: "The interviewer response could not be completed" } })}\n\n`);
+    } finally {
+      clearTimeout(timeout); res.removeListener("close", disconnect);
     }
   });
 
@@ -394,7 +478,8 @@ export function createApp(config) {
     const language = normalizeLanguage(input.language);
     try {
       if (input.action === "status") {
-        return res.json({ configured: Boolean(config.bhashiniUserId && config.bhashiniApiKey), language, requestId: req.requestId });
+        const [, voice] = await Promise.all([getBhashiniPipeline(config, "asr", language), getBhashiniPipeline(config, "tts", language)]);
+        return res.json({ configured: true, language, serviceId: voice.serviceId, requestId: req.requestId });
       }
       if (input.action === "asr") {
         const data = await callBhashini(config, "asr", language, input.audioContent, input.samplingRate, "female");
@@ -402,7 +487,7 @@ export function createApp(config) {
         return res.json({ transcript, fallbackPrompt: transcript ? null : "Sorry, I couldn't hear that clearly. Could you repeat your answer?", requestId: req.requestId });
       }
       const cleanText = input.text.replace(/```[\s\S]*?```/g, " code block ").replace(/[*_`#>]/g, "").replace(/\s+/g, " ").trim();
-      const data = await callBhashini(config, "tts", language, cleanText, 22050, input.gender);
+      const data = await callBhashini(config, "tts", language, cleanText, 22050, input.gender, input.serviceId);
       return res.json({ audioContent: data?.pipelineResponse?.[0]?.audio?.[0]?.audioContent || "", requestId: req.requestId });
     } catch (error) {
       log("error", "BHASHINI_REQUEST_FAILED", { requestId: req.requestId, candidateId: req.user.id, action: input.action, message: error.message });

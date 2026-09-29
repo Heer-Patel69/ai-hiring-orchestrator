@@ -19,7 +19,17 @@ import {
   PhoneOff,
   Waves,
 } from "lucide-react";
+import { FinalTranscriptBuffer } from "@/lib/interview-turns";
 import { useToast } from "@/hooks/use-toast";
+
+export type VoiceState =
+  | "IDLE"
+  | "LISTENING"
+  | "PROCESSING_SPEECH"
+  | "THINKING"
+  | "AI_SPEAKING"
+  | "INTERRUPTED"
+  | "ERROR";
 
 export interface Message {
   id: string;
@@ -32,11 +42,13 @@ export interface Message {
 interface ContinuousVoicePanelProps {
   messages: Message[];
   isLoading: boolean;
-  onSendMessage: (message: string) => void;
+  onSendMessage: (message: string, utteranceId?: string) => void | Promise<void>;
+  onListeningChange?: (listening: boolean) => void;
   className?: string;
   autoListen?: boolean;
   aiSpeaking?: boolean;
   onCandidateSpeech?: (text: string) => void;
+  onBargeIn?: () => void;
 }
 
 export function ContinuousVoicePanel({
@@ -47,303 +59,157 @@ export function ContinuousVoicePanel({
   autoListen = true,
   aiSpeaking = false,
   onCandidateSpeech,
+  onBargeIn,
+  onListeningChange,
 }: ContinuousVoicePanelProps) {
   const { toast } = useToast();
   const [inputValue, setInputValue] = useState("");
   const [isListening, setIsListening] = useState(false);
-  const [isContinuousMode, setIsContinuousMode] = useState(false);
+  const [isContinuousMode, setIsContinuousMode] = useState(autoListen);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [isSpeakingEnabled, setIsSpeakingEnabled] = useState(true);
   const [isSupported, setIsSupported] = useState(true);
+  const [voiceState, setVoiceState] = useState<VoiceState>("IDLE");
   
   const scrollRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
-  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const lastTranscriptRef = useRef("");
-  const restartTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const isRestartingRef = useRef(false);
-  const isContinuousModeRef = useRef(false);
-  const aiSpeakingRef = useRef(false);
-  const isLoadingRef = useRef(false);
+  const callbacks = useRef({ onSendMessage, onCandidateSpeech, onBargeIn, onListeningChange });
+  callbacks.current = { onSendMessage, onCandidateSpeech, onBargeIn, onListeningChange };
+  const gate = useRef({ aiSpeaking, isLoading, autoListen, isContinuousMode });
+  gate.current = { aiSpeaking, isLoading, autoListen, isContinuousMode };
+  const submitting = useRef(false);
+  const finals = useRef(new FinalTranscriptBuffer());
+  const silence = useRef<ReturnType<typeof setTimeout>>();
+  const restart = useRef<ReturnType<typeof setTimeout>>();
+  const recognitionActive = useRef(false);
+  const mounted = useRef(false);
+  const allowed = useCallback(() => mounted.current && gate.current.autoListen && gate.current.isContinuousMode &&
+    !gate.current.aiSpeaking && !gate.current.isLoading && !submitting.current, []);
 
-  // Keep refs in sync with state
-  useEffect(() => {
-    isContinuousModeRef.current = isContinuousMode;
-  }, [isContinuousMode]);
-
-  useEffect(() => {
-    aiSpeakingRef.current = aiSpeaking;
-  }, [aiSpeaking]);
-
-  useEffect(() => {
-    isLoadingRef.current = isLoading;
-  }, [isLoading]);
-
-  const onSendMessageRef = useRef(onSendMessage);
-  useEffect(() => {
-    onSendMessageRef.current = onSendMessage;
-  }, [onSendMessage]);
-
-  const onCandidateSpeechRef = useRef(onCandidateSpeech);
-  useEffect(() => {
-    onCandidateSpeechRef.current = onCandidateSpeech;
-  }, [onCandidateSpeech]);
-
-  // Auto-scroll to bottom
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  const clearPending = useCallback(() => {
+    clearTimeout(silence.current);
+    finals.current.clear();
+    setInterimTranscript("");
+    callbacks.current.onCandidateSpeech?.("");
+  }, []);
+  const commit = useCallback(async (text: string) => {
+    if (!text.trim() || submitting.current || gate.current.isLoading) return;
+    submitting.current = true;
+    const utteranceId = crypto.randomUUID();
+    clearPending();
+    recognitionRef.current?.abort();
+    setVoiceState("PROCESSING_SPEECH");
+    if (import.meta.env.DEV) console.debug(`[STT] Final transcript turn=${utteranceId}`);
+    try { await callbacks.current.onSendMessage(text.trim(), utteranceId); }
+    finally {
+      submitting.current = false;
+      if (allowed()) restart.current = setTimeout(() => {
+        if (allowed() && !recognitionActive.current) {
+          try { recognitionRef.current?.start(); } catch { /* onend also restarts */ }
+        }
+      }, 200);
     }
+  }, [allowed, clearPending]);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
   }, [messages, interimTranscript]);
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (e) {
-          // Ignore cleanup errors
-        }
-      }
-    };
-  }, []);
-
-  // Initialize speech recognition ONCE
-  useEffect(() => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    
-    if (!SpeechRecognition) {
-      setIsSupported(false);
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
+    mounted.current = true;
+    const Recognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!Recognition) { setIsSupported(false); return () => { mounted.current = false; }; }
+    const recognition = new Recognition();
+    recognitionRef.current = recognition;
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = "en-US";
-    recognition.maxAlternatives = 1;
-
+    recognition.onstart = () => {
+      if (!allowed()) { recognition.abort(); return; }
+      finals.current.resetRun();
+      recognitionActive.current = true;
+      setIsListening(true);
+      callbacks.current.onListeningChange?.(true);
+      setVoiceState("LISTENING");
+    };
     recognition.onresult = (event: any) => {
+      if (!allowed()) return;
       let interim = "";
-      let final = "";
-
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          final += transcript;
-        } else {
-          interim += transcript;
-        }
+        if (event.results[i].isFinal) finals.current.add(i, event.results[i][0].transcript);
       }
-
-      if (interim) {
-        setInterimTranscript(interim);
-        onCandidateSpeechRef.current?.(interim);
-        // Reset silence timeout on speech
-        if (silenceTimeoutRef.current) {
-          clearTimeout(silenceTimeoutRef.current);
-        }
-        // If candidate stops speaking mid-sentence for 1.8s, submit interim speech as final
-        silenceTimeoutRef.current = setTimeout(() => {
-          if (interim.trim() && !isLoadingRef.current) {
-            const spokenText = interim.trim();
-            setInterimTranscript("");
-            onSendMessageRef.current(spokenText);
-          }
-        }, 1800);
+      for (let i = 0; i < event.results.length; i++) {
+        if (!event.results[i].isFinal) interim += event.results[i][0].transcript;
       }
-
-      if (final && final.trim()) {
-        lastTranscriptRef.current = final.trim();
-        setInterimTranscript("");
-        onCandidateSpeechRef.current?.(final.trim());
-        
-        // Wait for short silence before sending response
-        if (silenceTimeoutRef.current) {
-          clearTimeout(silenceTimeoutRef.current);
-        }
-        
-        silenceTimeoutRef.current = setTimeout(() => {
-          if (lastTranscriptRef.current && !isLoadingRef.current) {
-            const speechToSend = lastTranscriptRef.current;
-            lastTranscriptRef.current = "";
-            setInterimTranscript("");
-            onSendMessageRef.current(speechToSend);
-          }
-        }, 1100); // 1.1s silence = commit spoken answer
-      }
+      const live = [finals.current.text, interim.trim()].filter(Boolean).join(" ");
+      setInterimTranscript(live);
+      callbacks.current.onCandidateSpeech?.(live);
+      clearTimeout(silence.current);
+      // Interim results are display-only. Wait for final results and a natural pause.
+      if (!interim.trim() && finals.current.text) silence.current = setTimeout(() => {
+        if (allowed()) void commit(finals.current.take());
+      }, 1100);
     };
-
-    recognition.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
-      
-      if (event.error === "not-allowed") {
-        toast({
-          title: "Microphone Blocked",
-          description: "Please allow microphone access in your browser settings.",
-          variant: "destructive",
-        });
-        setIsListening(false);
-        setIsContinuousMode(false);
-        isContinuousModeRef.current = false;
-        return;
-      }
-      
-      // For no-speech or aborted, don't show error - just restart if in continuous mode
-      if (event.error === "no-speech" || event.error === "aborted") {
-        // Will be handled by onend
-        return;
-      }
-      
-      // For other errors, attempt restart with debounce
-      if (isContinuousModeRef.current && !aiSpeakingRef.current && !isRestartingRef.current) {
-        scheduleRestart();
-      }
-    };
-
     recognition.onend = () => {
+      recognitionActive.current = false;
+      if (!mounted.current) return;
       setIsListening(false);
-      
-      // Auto-restart if still in continuous mode and AI is not speaking
-      if (isContinuousModeRef.current && !aiSpeakingRef.current && !isRestartingRef.current) {
-        scheduleRestart();
+      callbacks.current.onListeningChange?.(false);
+      if (allowed()) {
+        clearTimeout(restart.current);
+        restart.current = setTimeout(() => {
+          if (allowed()) { try { recognition.start(); } catch { setVoiceState("ERROR"); } }
+        }, 200);
       }
     };
-
-    recognitionRef.current = recognition;
-  }, [toast]); // Only depend on toast which is stable
-
-  // Debounced restart to prevent rapid reconnection cycles
-  const scheduleRestart = useCallback(() => {
-    if (isRestartingRef.current || !isContinuousModeRef.current) return;
-    
-    isRestartingRef.current = true;
-    
-    // Clear any existing restart timeout
-    if (restartTimeoutRef.current) {
-      clearTimeout(restartTimeoutRef.current);
-    }
-    
-    // Wait a moment before restarting to avoid rapid cycles
-    restartTimeoutRef.current = setTimeout(() => {
-      isRestartingRef.current = false;
-      
-      if (isContinuousModeRef.current && !aiSpeakingRef.current && recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-          setIsListening(true);
-        } catch (e: any) {
-          // If already started, ignore
-          if (!e.message?.includes("already started")) {
-            console.error("Failed to restart recognition:", e);
-          }
-        }
+    recognition.onerror = (event: any) => {
+      if (!mounted.current || event.error === "aborted" || event.error === "no-speech") return;
+      console.warn("[STT] Recognition error", event.error);
+      if (["not-allowed", "service-not-allowed", "audio-capture"].includes(event.error)) {
+        gate.current.isContinuousMode = false;
+        setIsContinuousMode(false);
+        clearPending();
+        toast({ title: "Microphone unavailable", description: "Check microphone permissions and your input device, then enable voice again.", variant: "destructive" });
       }
-    }, 300); // 300ms debounce
-  }, []);
+      setVoiceState("ERROR");
+    };
+    return () => {
+      mounted.current = false;
+      clearTimeout(silence.current); clearTimeout(restart.current);
+      recognition.onstart = recognition.onend = recognition.onerror = recognition.onresult = null;
+      recognition.abort(); recognitionRef.current = null;
+      callbacks.current.onListeningChange?.(false);
+    };
+  }, [toast, allowed, commit, clearPending]);
 
-  // Handle AI speaking state changes
+  // Recognition is suspended during playback to prevent the AI's own voice becoming an answer.
   useEffect(() => {
-    if (!recognitionRef.current || !isContinuousMode) return;
-    
-    if (aiSpeaking) {
-      // Stop listening while AI speaks
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        // Ignore if already stopped
-      }
-      setIsListening(false);
-    } else {
-      // Resume listening when AI stops speaking
-      scheduleRestart();
+    clearTimeout(restart.current);
+    if (!allowed()) {
+      clearPending(); recognitionRef.current?.abort();
+      setIsListening(false); callbacks.current.onListeningChange?.(false);
+      setVoiceState(aiSpeaking ? "AI_SPEAKING" : isLoading ? "THINKING" : "IDLE");
+    } else if (!recognitionActive.current) {
+      restart.current = setTimeout(() => {
+        if (allowed()) { try { recognitionRef.current?.start(); } catch { /* wait for onend */ } }
+      }, 200);
     }
-  }, [aiSpeaking, isContinuousMode, scheduleRestart]);
+    return () => clearTimeout(restart.current);
+  }, [aiSpeaking, isLoading, autoListen, isContinuousMode, allowed, clearPending]);
 
-  const startContinuousListening = useCallback(async () => {
-    if (!recognitionRef.current || !isSupported) return;
-
-    try {
-      // Request microphone permission
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      setIsContinuousMode(true);
-      isContinuousModeRef.current = true;
-      
-      try {
-        recognitionRef.current.start();
-        setIsListening(true);
-      } catch (e: any) {
-        if (!e.message?.includes("already started")) {
-          throw e;
-        }
-        setIsListening(true);
-      }
-      
-      toast({
-        title: "Voice Mode Active",
-        description: "Speak naturally — I'll listen continuously and respond.",
-      });
-    } catch (error) {
-      console.error("Failed to start listening:", error);
-      toast({
-        title: "Microphone Error",
-        description: "Could not access microphone. Please check permissions.",
-        variant: "destructive",
-      });
+  const startContinuousListening = useCallback(() => setIsContinuousMode(true), []);
+  const stopContinuousListening = useCallback(() => setIsContinuousMode(false), []);
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (inputValue.trim() && !isLoading && !submitting.current) {
+      callbacks.current.onBargeIn?.();
+      void commit(inputValue); setInputValue("");
     }
-  }, [isSupported, toast]);
-
-  const stopContinuousListening = useCallback(() => {
-    setIsContinuousMode(false);
-    isContinuousModeRef.current = false;
-    
-    // Clear any pending restarts
-    if (restartTimeoutRef.current) {
-      clearTimeout(restartTimeoutRef.current);
-      restartTimeoutRef.current = null;
-    }
-    isRestartingRef.current = false;
-    
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (e) {
-        // Ignore if already stopped
-      }
-    }
-    
-    setIsListening(false);
-    setInterimTranscript("");
-    
-    if (silenceTimeoutRef.current) {
-      clearTimeout(silenceTimeoutRef.current);
-    }
-  }, []);
-
-  // Auto-start continuous listening when autoListen is enabled
-  useEffect(() => {
-    if (autoListen && isSupported && !isContinuousMode) {
-      const timer = setTimeout(() => {
-        startContinuousListening();
-      }, 600);
-      return () => clearTimeout(timer);
-    }
-  }, [autoListen, isSupported, isContinuousMode, startContinuousListening]);
-
-  const handleSubmit = useCallback(
-    (e: React.FormEvent) => {
-      e.preventDefault();
-      if (inputValue.trim() && !isLoading) {
-        onSendMessage(inputValue.trim());
-        setInputValue("");
-      }
-    },
-    [inputValue, isLoading, onSendMessage]
-  );
+  };
 
   const formatTime = (date: Date) => {
     return date.toLocaleTimeString("en-US", {
@@ -353,274 +219,184 @@ export function ContinuousVoicePanel({
   };
 
   return (
-    <div className={cn("flex flex-col h-full rounded-xl border border-border bg-card", className)}>
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 border-b border-border">
-        <div className="flex items-center gap-2">
-          <div className={cn(
-            "h-8 w-8 rounded-full flex items-center justify-center transition-colors",
-            isContinuousMode ? "bg-success/10" : "bg-primary/10"
-          )}>
-            <Brain className={cn(
-              "h-4 w-4",
-              isContinuousMode ? "text-success" : "text-primary"
-            )} />
-          </div>
-          <div>
-            <h3 className="font-semibold text-sm">AI Interviewer</h3>
-            <div className="flex items-center gap-1">
-              {isContinuousMode ? (
-                <Badge variant="outline" className="text-xs gap-1 bg-success/10 text-success border-success/30">
-                  <span className="h-1.5 w-1.5 rounded-full bg-success animate-pulse" />
-                  {aiSpeaking ? "Speaking" : isListening ? "Listening" : "Ready"}
-                </Badge>
-              ) : (
-                <span className="text-xs text-muted-foreground">
-                  {isLoading ? "Thinking..." : "Ready"}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            variant={isSpeakingEnabled ? "default" : "outline"}
-            className="h-8"
-            onClick={() => setIsSpeakingEnabled(!isSpeakingEnabled)}
-          >
-            {isSpeakingEnabled ? (
-              <Volume2 className="h-4 w-4" />
-            ) : (
-              <VolumeX className="h-4 w-4" />
-            )}
-          </Button>
-        </div>
-      </div>
-
-      {/* Messages */}
-      <ScrollArea ref={scrollRef} className="flex-1 p-4">
-        <div className="space-y-4">
-          {messages.length === 0 && !isContinuousMode && (
-            <div className="text-center py-12">
-              <div className="h-16 w-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
-                <Waves className="h-8 w-8 text-primary" />
-              </div>
-              <h3 className="font-semibold mb-2">Continuous Voice Mode</h3>
-              <p className="text-sm text-muted-foreground max-w-xs mx-auto">
-                Start voice mode for a natural conversation. 
-                Speak freely — no need to press buttons!
+    <div
+      data-voice-state={voiceState}
+      className={cn(
+        "flex flex-col h-full min-h-0 bg-card/60 backdrop-blur-xl rounded-xl border border-border/60 overflow-hidden shadow-sm",
+        className
+      )}
+    >
+      {/* Messages Scroll Area */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2" ref={scrollRef}>
+        <div className="space-y-3 pb-2">
+          {messages.length === 0 && (
+            <div className="text-center py-8 text-muted-foreground">
+              <Brain className="h-8 w-8 mx-auto mb-2 text-primary opacity-60" />
+              <p className="text-xs font-medium">Interview starting...</p>
+              <p className="text-[11px] text-muted-foreground/80 mt-1">
+                The AI interviewer is preparing your first question.
               </p>
+              {!isContinuousMode && isSupported && (
+                <Button
+                  onClick={startContinuousListening}
+                  variant="outline"
+                  size="sm"
+                  className="mt-3 text-xs gap-1.5 border-primary/30 text-primary"
+                >
+                  <Phone className="h-3.5 w-3.5" />
+                  Enable Microphone
+                </Button>
+              )}
             </div>
           )}
 
-          <AnimatePresence mode="popLayout">
-            {messages.map((message) => (
+          {messages.map((message) => {
+            const isAI = message.role === "assistant";
+            return (
               <motion.div
                 key={message.id}
-                initial={{ opacity: 0, y: 10 }}
+                initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className={cn(
-                  "flex gap-3",
-                  message.role === "user" && "flex-row-reverse"
-                )}
+                className={cn("flex gap-2.5", !isAI && "flex-row-reverse")}
               >
                 <div
                   className={cn(
-                    "h-8 w-8 rounded-full flex items-center justify-center shrink-0",
-                    message.role === "assistant"
-                      ? "bg-primary/10"
-                      : "bg-success/10"
+                    "h-7 w-7 rounded-full flex items-center justify-center shrink-0 text-xs",
+                    isAI ? "bg-primary/10 text-primary border border-primary/20" : "bg-secondary text-secondary-foreground"
                   )}
                 >
-                  {message.role === "assistant" ? (
-                    <Brain className="h-4 w-4 text-primary" />
-                  ) : (
-                    <User className="h-4 w-4 text-success" />
-                  )}
+                  {isAI ? <Brain className="h-3.5 w-3.5" /> : <User className="h-3.5 w-3.5" />}
                 </div>
 
-                <div
-                  className={cn(
-                    "flex-1 space-y-1",
-                    message.role === "user" && "text-right"
-                  )}
-                >
+                <div className={cn("max-w-[85%] space-y-1", !isAI && "text-right")}>
                   <div
                     className={cn(
-                      "inline-block rounded-xl px-4 py-2.5 text-sm max-w-[85%]",
-                      message.role === "assistant"
-                        ? "bg-secondary text-secondary-foreground"
-                        : "bg-primary text-primary-foreground"
+                      "inline-block rounded-xl px-3 py-2 text-sm leading-relaxed text-left",
+                      isAI
+                        ? "bg-secondary/70 border border-border/50 text-foreground"
+                        : "bg-primary text-primary-foreground font-medium shadow-sm"
                     )}
                   >
-                    <div className="whitespace-pre-wrap">{message.content}</div>
-                    {message.isStreaming && (
-                      <span className="inline-block w-1.5 h-4 bg-current ml-0.5 animate-pulse" />
-                    )}
+                    <p className="whitespace-pre-wrap">{message.content}</p>
                   </div>
-                  <p className="text-xs text-muted-foreground px-1">
-                    {formatTime(message.timestamp)}
-                  </p>
+                  <div className="flex items-center gap-1.5 px-1 text-[10px] text-muted-foreground">
+                    <span>{formatTime(new Date(message.timestamp))}</span>
+                  </div>
                 </div>
               </motion.div>
-            ))}
-          </AnimatePresence>
+            );
+          })}
 
-          {/* Loading indicator */}
-          {isLoading && messages[messages.length - 1]?.role !== "assistant" && (
+          {/* Thinking indicator */}
+          {isLoading && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              className="flex gap-3"
+              className="flex gap-2.5"
             >
-              <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
-                <Brain className="h-4 w-4 text-primary" />
+              <div className="h-7 w-7 rounded-full bg-primary/10 flex items-center justify-center shrink-0 border border-primary/20">
+                <Brain className="h-3.5 w-3.5 text-primary" />
               </div>
-              <div className="bg-secondary rounded-xl px-4 py-3">
-                <div className="flex items-center gap-2">
-                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                  <span className="text-sm text-muted-foreground">Thinking...</span>
+              <div className="bg-secondary/70 rounded-xl px-3 py-2 border border-border/50">
+                <div className="flex items-center gap-1.5">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                  <span className="text-xs text-muted-foreground">Thinking...</span>
                 </div>
               </div>
             </motion.div>
           )}
 
-          {/* Interim transcript */}
+          {/* Live Interim Transcript Bubble */}
           {interimTranscript && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
-              className="flex gap-3 flex-row-reverse"
+              className="flex gap-2.5 flex-row-reverse"
             >
-              <div className="h-8 w-8 rounded-full bg-success/10 flex items-center justify-center">
-                <User className="h-4 w-4 text-success" />
+              <div className="h-7 w-7 rounded-full bg-success/15 flex items-center justify-center shrink-0 text-success border border-success/30">
+                <User className="h-3.5 w-3.5" />
               </div>
-              <div className="text-right">
-                <div className="inline-block rounded-xl px-4 py-2.5 text-sm max-w-[85%] bg-primary/20 text-primary border border-primary/30">
-                  <div className="flex items-center gap-2">
-                    <span className="italic">{interimTranscript}</span>
-                    <span className="h-2 w-2 rounded-full bg-primary animate-pulse" />
+              <div className="text-right max-w-[85%]">
+                <div className="inline-block rounded-xl px-3 py-2 text-sm bg-success/10 text-foreground border border-success/30 shadow-xs">
+                  <div className="flex items-center gap-1.5">
+                    <span className="italic">"{interimTranscript}"</span>
+                    <span className="h-1.5 w-1.5 rounded-full bg-success animate-pulse shrink-0" />
                   </div>
                 </div>
+                <p className="text-[10px] text-success font-medium mt-0.5 mr-1">Listening...</p>
               </div>
             </motion.div>
           )}
 
-          {/* Listening indicator */}
-          {isContinuousMode && isListening && !aiSpeaking && !interimTranscript && !isLoading && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="flex justify-center py-4"
-            >
-              <Badge variant="outline" className="gap-2 bg-success/5 border-success/20">
-                <Mic className="h-3 w-3 text-success" />
-                <span className="text-success">Listening...</span>
-                <span className="h-2 w-2 rounded-full bg-success animate-pulse" />
-              </Badge>
-            </motion.div>
-          )}
-
-          {/* AI Speaking indicator */}
-          {aiSpeaking && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="flex justify-center py-4"
-            >
-              <Badge variant="outline" className="gap-2 bg-primary/5 border-primary/20">
-                <div className="flex gap-0.5">
-                  {[1, 2, 3, 4, 5].map((i) => (
-                    <motion.div
-                      key={i}
-                      animate={{ height: [4, 12, 4] }}
-                      transition={{
-                        duration: 0.5,
-                        repeat: Infinity,
-                        delay: i * 0.1,
-                      }}
-                      className="w-0.5 bg-primary rounded-full"
-                    />
-                  ))}
-                </div>
-                <span className="text-primary">AI Speaking...</span>
-              </Badge>
-            </motion.div>
-          )}
+          {/* Internal scroll anchor - keeps main window fixed */}
+          <div ref={messagesEndRef} className="h-0 w-full shrink-0" aria-hidden="true" />
         </div>
-      </ScrollArea>
+      </div>
 
-      {/* Input Area */}
-      <div className="p-4 border-t border-border">
-        {/* Voice control */}
-        <div className="flex items-center justify-center gap-4 mb-3">
-          {!isContinuousMode ? (
-            <Button
-              onClick={startContinuousListening}
-              disabled={!isSupported}
-              className="gap-2 bg-success hover:bg-success/90"
-              size="lg"
-            >
-              <Phone className="h-5 w-5" />
-              Start Voice Mode
-            </Button>
-          ) : (
-            <Button
-              onClick={stopContinuousListening}
-              variant="destructive"
-              className="gap-2"
-              size="lg"
-            >
-              <PhoneOff className="h-5 w-5" />
-              End Voice Mode
-            </Button>
-          )}
-        </div>
-
-        {/* Text input fallback */}
+      {aiSpeaking && <Button variant="outline" size="sm" className="shrink-0 mx-2 my-1" onClick={() => {
+        setVoiceState("INTERRUPTED"); callbacks.current.onBargeIn?.(); setIsContinuousMode(true);
+      }}>Interrupt &amp; answer</Button>}
+      {/* Compact Bottom Toolbar & Input Bar */}
+      <div className="shrink-0 p-2 sm:p-2.5 border-t border-border/60 bg-card/70">
         <form onSubmit={handleSubmit} className="flex items-center gap-2">
+          {/* Microphone continuous mode toggle */}
           <Button
             type="button"
-            size="icon"
-            variant={isListening ? "default" : "outline"}
-            className="shrink-0"
+            size="sm"
+            variant={isContinuousMode ? "default" : "outline"}
+            className={cn(
+              "h-8 px-2.5 shrink-0 gap-1 text-xs font-medium",
+              isContinuousMode && "bg-success hover:bg-success/90 text-success-foreground"
+            )}
             onClick={isContinuousMode ? stopContinuousListening : startContinuousListening}
             disabled={!isSupported}
+            title={isContinuousMode ? "Voice mode active — click to pause" : "Click to enable continuous voice mode"}
           >
-            {isListening ? (
-              <MicOff className="h-4 w-4" />
+            {isContinuousMode ? (
+              <>
+                <Mic className="h-3.5 w-3.5 animate-pulse" />
+                <span className="hidden sm:inline">Voice On</span>
+              </>
             ) : (
-              <Mic className="h-4 w-4" />
+              <>
+                <MicOff className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Voice Off</span>
+              </>
             )}
           </Button>
 
+          {/* Text input fallback */}
           <Input
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            placeholder={isContinuousMode ? "Or type your response..." : "Type your answer..."}
-            className="flex-1"
+            placeholder={isContinuousMode ? "Speak or type your answer..." : "Type your answer..."}
+            className="flex-1 h-8 text-sm bg-background/80"
             disabled={isLoading}
           />
 
           <Button
             type="submit"
             size="icon"
+            className="h-8 w-8 shrink-0"
             disabled={!inputValue.trim() || isLoading}
           >
-            <Send className="h-4 w-4" />
+            <Send className="h-3.5 w-3.5" />
           </Button>
         </form>
 
-        <p className="text-xs text-muted-foreground text-center mt-2">
-          <Sparkles className="h-3 w-3 inline mr-1" />
-          {isContinuousMode 
-            ? "Speak naturally — AI listens continuously"
-            : "Enable voice mode for hands-free conversation"
-          }
-        </p>
+        {/* State Indicator Footnote */}
+        <div className="flex items-center justify-between mt-1 px-1 text-[10px] text-muted-foreground">
+          <span className="flex items-center gap-1">
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full inline-block",
+                isListening ? "bg-success animate-pulse" : "bg-muted-foreground/40"
+              )}
+            />
+            {{ IDLE: "Voice idle", LISTENING: "Listening...", PROCESSING_SPEECH: "Understanding...", THINKING: "Thinking...", AI_SPEAKING: "Speaking — use Interrupt to answer", INTERRUPTED: "Speech interrupted", ERROR: "Voice unavailable — check permissions" }[voiceState]}
+          </span>
+          <span className="text-[10px] opacity-75">Auto-submits on speech pause</span>
+        </div>
       </div>
     </div>
   );

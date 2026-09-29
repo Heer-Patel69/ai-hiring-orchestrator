@@ -11,6 +11,7 @@ export interface AntiCheatEvent {
     | "paste_attempt"
     | "right_click"
     | "screenshot_attempt"
+    | "camera_blocked"
     | "multiple_monitors";
   timestamp: Date;
   severity: "low" | "medium" | "high" | "critical";
@@ -78,6 +79,8 @@ export function useAntiCheat(config: AntiCheatConfig = {}) {
     stateRef.current = state;
   }, [state]);
 
+  const configRef = useRef(mergedConfig); configRef.current = mergedConfig;
+
   // Add event helper
   const addEvent = useCallback((event: AntiCheatEvent) => {
     setState((prev) => {
@@ -99,8 +102,8 @@ export function useAntiCheat(config: AntiCheatConfig = {}) {
       };
     });
     
-    mergedConfig.onEvent?.(event);
-  }, [mergedConfig.onEvent]);
+    configRef.current.onEvent?.(event);
+  }, []);
 
   // Request fullscreen
   const requestFullscreen = useCallback(async () => {
