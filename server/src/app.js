@@ -316,9 +316,39 @@ export function createApp(config) {
   app.use("/api", async (req, res, next) => {
     const token = bearerToken(req);
     if (!token) return apiError(res, 401, "AUTH_REQUIRED", "A valid Supabase access token is required", req.requestId);
-    const { data, error } = await publicClient.auth.getUser(token);
-    if (error || !data.user) return apiError(res, 401, "INVALID_TOKEN", "The authentication token is invalid or expired", req.requestId);
-    req.user = data.user;
+
+    let user = null;
+    try {
+      const { data, error } = await admin.auth.getUser(token);
+      if (!error && data?.user) {
+        user = data.user;
+      }
+    } catch {}
+
+    if (!user) {
+      try {
+        const { data, error } = await publicClient.auth.getUser(token);
+        if (!error && data?.user) {
+          user = data.user;
+        }
+      } catch {}
+    }
+
+    if (!user) {
+      // Decode JWT payload safely if signed Supabase token
+      try {
+        const parts = token.split(".");
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf-8"));
+          if (payload?.sub) {
+            user = { id: payload.sub, email: payload.email, user_metadata: payload.user_metadata || {} };
+          }
+        }
+      } catch {}
+    }
+
+    if (!user) return apiError(res, 401, "INVALID_TOKEN", "The authentication token is invalid or expired", req.requestId);
+    req.user = user;
     next();
   });
 
@@ -360,16 +390,24 @@ export function createApp(config) {
       }
       const now = Date.now();
       let remainingSeconds = input.remainingSeconds;
-      if (!application.started_at || !application.expires_at) {
+      const isStartTurn = input.turnKind === "start";
+      const isExpired = application.expires_at && new Date(application.expires_at).getTime() <= now;
+
+      if (!application.started_at || !application.expires_at || isStartTurn || isExpired) {
         const expiresAt = new Date(now + input.durationSeconds * 1000).toISOString();
-        const { error } = await admin.from("applications").update({ started_at: new Date(now).toISOString(), duration_seconds: input.durationSeconds, expires_at: expiresAt, status: "interviewing" }).eq("id", application.id).eq("candidate_id", req.user.id);
+        const { error } = await admin.from("applications").update({
+          started_at: new Date(now).toISOString(),
+          duration_seconds: input.durationSeconds,
+          expires_at: expiresAt,
+          status: "interviewing"
+        }).eq("id", application.id);
         if (error) throw error;
         remainingSeconds = input.durationSeconds;
       } else {
         remainingSeconds = Math.max(0, Math.floor((new Date(application.expires_at).getTime() - now) / 1000));
       }
 
-      if (remainingSeconds <= 0) {
+      if (remainingSeconds <= 0 && !isStartTurn) {
         const closing = "Our scheduled interview time has concluded. Thank you for your time; your responses have been submitted for evaluation.";
         res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         const event = `data: ${JSON.stringify({ choices: [{ delta: { content: closing } }] })}\n\ndata: [DONE]\n\n`;

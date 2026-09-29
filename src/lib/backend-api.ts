@@ -7,9 +7,15 @@ export function backendUrl(path: string): string {
 }
 
 export async function backendAuthHeaders(): Promise<Record<string, string>> {
-  const { data, error } = await supabase.auth.getSession();
-  if (error) throw error;
-  const token = data.session?.access_token;
+  let { data } = await supabase.auth.getSession();
+  let token = data.session?.access_token;
+
+  // Refresh if token is missing or expiring within 60 seconds
+  if (!token || (data.session?.expires_at && data.session.expires_at * 1000 - Date.now() < 60000)) {
+    const refreshed = await supabase.auth.refreshSession();
+    token = refreshed.data.session?.access_token || token;
+  }
+
   if (!token) throw new Error("You must be signed in to use this service");
   return {
     "Content-Type": "application/json",

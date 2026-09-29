@@ -420,16 +420,17 @@ export default function AIInterviewRoomPage() {
             const remaining = Math.max(0, Math.floor((expiresMs - nowMs) / 1000));
             const elapsed = Math.max(0, Math.floor((nowMs - new Date(application.started_at).getTime()) / 1000));
 
-            setInterviewDuration(application.duration_seconds || configuredDuration);
-            setRemainingTime(remaining);
-            setElapsedTime(elapsed);
-            expiresAtRef.current = new Date(application.expires_at);
-
             if (remaining > 0 && (application.status === "interviewing" || application.status === "applied")) {
-              // Media permissions and screen sharing must be verified again after reload.
-            } else if (remaining <= 0 && application.status === "interviewing") {
-              // Expired while candidate was away, finalize gracefully
-              void handleEndInterviewRef.current();
+              setInterviewDuration(application.duration_seconds || configuredDuration);
+              setRemainingTime(remaining);
+              setElapsedTime(elapsed);
+              expiresAtRef.current = new Date(application.expires_at);
+            } else {
+              // Stale or past interview session: reset to fresh duration so candidate can begin
+              setInterviewDuration(configuredDuration);
+              setRemainingTime(configuredDuration);
+              setElapsedTime(0);
+              expiresAtRef.current = null;
             }
           } else {
             setInterviewDuration(configuredDuration);
@@ -885,16 +886,18 @@ export default function AIInterviewRoomPage() {
 
     const durSeconds = interviewDuration || 120;
     const startedAt = new Date();
-    const resuming = Boolean(expiresAtRef.current);
-    const expiresAt = expiresAtRef.current || new Date(startedAt.getTime() + durSeconds * 1000);
+    const hasValidFutureExpiry = Boolean(expiresAtRef.current && expiresAtRef.current.getTime() > Date.now());
+    const expiresAt = hasValidFutureExpiry
+      ? expiresAtRef.current!
+      : new Date(startedAt.getTime() + durSeconds * 1000);
     expiresAtRef.current = expiresAt;
-    const secondsLeft = Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
+    const secondsLeft = Math.max(1, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
     setRemainingTime(secondsLeft);
     setElapsedTime(Math.max(0, durSeconds - secondsLeft));
 
     // Start background persistence and recording concurrently to minimize time-to-first-question
     const backgroundSetupPromise = Promise.allSettled([
-      applicationId && !resuming
+      applicationId
         ? supabase.from("applications").update({
             started_at: startedAt.toISOString(),
             duration_seconds: durSeconds,
